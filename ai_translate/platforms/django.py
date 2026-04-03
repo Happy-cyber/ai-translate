@@ -92,40 +92,135 @@ def scan_source(project_root: Path) -> dict[str, str]:
 # ── Language detection ────────────────────────────────────────────────
 
 
+_LOCALE_SKIP_DIRS = frozenset({
+    "venv", ".venv", "env", "node_modules", ".git",
+    "__pycache__", "build", "dist", ".tox",
+    "htmlcov", ".mypy_cache", ".ruff_cache",
+    "static", "media", "staticfiles", "collected_static",
+    ".idea", ".vscode", "Pods", "DerivedData",
+})
+
+
+def _find_all_locale_dirs(project_root: Path) -> list[Path]:
+    """Find ALL locale directories in the project.
+
+    Django projects often have multiple locale dirs:
+      - project_root/locale/
+      - project_root/myapp/locale/
+      - project_root/conf/locale/
+
+    Uses its own walk (NOT walk_project) because walk_project
+    skips 'locale' dirs by design (for source scanning).
+
+    Returns all found, sorted deepest first (app-level before root-level),
+    so app-specific translations take priority.
+    """
+    found: list[Path] = []
+
+    import os
+    for dirpath_str, dirnames, _ in os.walk(project_root):
+        # Skip irrelevant directories
+        dirnames[:] = [
+            d for d in dirnames
+            if d not in _LOCALE_SKIP_DIRS and not d.endswith(".egg-info")
+        ]
+
+        dirpath = Path(dirpath_str)
+        if dirpath.name == "locale" and dirpath != project_root:
+            found.append(dirpath)
+            dirnames.clear()  # don't recurse into locale/
+
+    # Sort: deeper paths first (app/locale before root/locale)
+    found.sort(key=lambda p: len(p.parts), reverse=True)
+
+    return found
+
+
+# The chosen locale dir for this session (reset between runs/tests)
+_chosen_locale: Path | None = None
+
+
+def _reset_locale_choice() -> None:
+    """Reset the cached locale choice. Used in tests."""
+    global _chosen_locale
+    _chosen_locale = None
+
+
+def _count_po_translations(locale_dir: Path) -> str:
+    """Return a summary of how many .po files and translations a locale dir has."""
+    po_count = 0
+    translated = 0
+    for po_file in locale_dir.rglob("*.po"):
+        po_count += 1
+        try:
+            po = polib.pofile(str(po_file))
+            translated += len([e for e in po if e.msgstr and e.msgstr.strip()])
+        except Exception:
+            pass
+    if po_count:
+        return f"{po_count} .po files, {translated:,} translations"
+    return "empty (no .po files)"
+
+
 def _find_locale_dir(project_root: Path) -> Path:
-    """Find or create the locale directory."""
-    # Check common locations
-    for candidate in (
-        project_root / "locale",
-        project_root / "conf" / "locale",
-    ):
-        if candidate.is_dir():
-            return candidate
+    """Find the locale directory, prompting user if multiple exist.
 
-    # Walk to find any existing locale dir
-    for dirpath, dirs, _ in walk_project(project_root):
-        if "locale" in dirs:
-            return dirpath / "locale"
+    If multiple locale dirs with .po files are found, asks the user
+    to choose. Caches the choice for the session.
+    """
+    global _chosen_locale
 
-    # Create default
-    locale = project_root / "locale"
-    locale.mkdir(parents=True, exist_ok=True)
-    return locale
+    if _chosen_locale and _chosen_locale.is_dir():
+        return _chosen_locale
+
+    all_dirs = _find_all_locale_dirs(project_root)
+
+    if not all_dirs:
+        locale = project_root / "locale"
+        locale.mkdir(parents=True, exist_ok=True)
+        _chosen_locale = locale
+        return locale
+
+    # Filter to dirs that actually have .po files
+    dirs_with_po = []
+    for loc in all_dirs:
+        if any(loc.rglob("*.po")):
+            dirs_with_po.append(loc)
+
+    if len(dirs_with_po) == 1:
+        _chosen_locale = dirs_with_po[0]
+        return _chosen_locale
+
+    if len(dirs_with_po) > 1:
+        # Multiple dirs with translations — ask the user (saved per project)
+        from ai_translate.cli.ui import prompt_choose_path
+        _chosen_locale = prompt_choose_path(
+            "locale directory",
+            dirs_with_po,
+            detail_fn=_count_po_translations,
+            pref_key="django_locale_dir",
+            project_root=project_root,
+        )
+        return _chosen_locale
+
+    # No dirs with .po — use first found
+    _chosen_locale = all_dirs[0]
+    return _chosen_locale
 
 
 def detect_target_languages(project_root: Path) -> dict[str, str]:
-    """Detect languages from existing locale/ subdirectories or settings.py."""
+    """Detect languages from the chosen locale directory or settings.py."""
     from ai_translate.cli.ui import COMMON_LANGUAGES
 
     locale_dir = _find_locale_dir(project_root)
     langs: dict[str, str] = {}
 
-    # From existing locale folders
     if locale_dir.is_dir():
         for child in sorted(locale_dir.iterdir()):
-            if child.is_dir() and child.name not in ("en", "en_US"):
+            if child.is_dir() and child.name not in ("en", "en_US", "__pycache__"):
                 code = child.name
-                langs[code] = COMMON_LANGUAGES.get(code, code)
+                if code not in langs:
+                    langs[code] = COMMON_LANGUAGES.get(code, code)
 
     # Try settings.py LANGUAGES
     if not langs:
@@ -154,30 +249,44 @@ def _po_path(locale_dir: Path, lang_code: str) -> Path:
 
 
 
+def _collect_existing_translations(locale_dirs: list[Path], lang_code: str) -> set[str]:
+    """Collect all translated msgids from ALL locale dirs for a language.
+
+    Scans every locale directory for .po files and merges them.
+    A string is considered translated if ANY locale dir has it translated.
+    """
+    existing: set[str] = set()
+    for locale_dir in locale_dirs:
+        path = _po_path(locale_dir, lang_code)
+        if not path.is_file():
+            continue
+        try:
+            po = polib.pofile(str(path))
+            for entry in po:
+                if entry.msgid_plural:
+                    if entry.msgstr_plural and any(v.strip() for v in entry.msgstr_plural.values()):
+                        existing.add(encode_plural(entry.msgid, entry.msgid_plural))
+                elif entry.msgstr and entry.msgstr.strip():
+                    existing.add(entry.msgid)
+        except Exception:
+            pass
+    return existing
+
+
 def get_missing_translations(
     project_root: Path,
     source_strings: dict[str, str],
     target_languages: dict[str, str],
 ) -> dict[str, list[str]]:
-    """Return ``{lang_code: [missing_msgids]}``."""
+    """Return ``{lang_code: [missing_msgids]}``.
+
+    Uses the user's chosen locale directory only.
+    """
     locale_dir = _find_locale_dir(project_root)
     missing: dict[str, list[str]] = {}
 
     for lang_code in target_languages:
-        path = _po_path(locale_dir, lang_code)
-        existing: set[str] = set()
-        if path.is_file():
-            try:
-                po = polib.pofile(str(path))
-                for entry in po:
-                    if entry.msgid_plural:
-                        # Plural entry: check if msgstr_plural has forms
-                        if entry.msgstr_plural and any(v.strip() for v in entry.msgstr_plural.values()):
-                            existing.add(encode_plural(entry.msgid, entry.msgid_plural))
-                    elif entry.msgstr and entry.msgstr.strip():
-                        existing.add(entry.msgid)
-            except Exception:
-                pass
+        existing = _collect_existing_translations([locale_dir], lang_code)
         lang_missing = [msg for msg in source_strings if msg not in existing]
         if lang_missing:
             missing[lang_code] = lang_missing

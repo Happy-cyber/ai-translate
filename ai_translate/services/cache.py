@@ -247,6 +247,54 @@ def update_cache(
     return cache
 
 
+# ── Project preferences (persisted user choices) ─────────────────────
+
+
+def _project_prefs_path(project_root: Path) -> Path:
+    return _project_dir(project_root) / "prefs.json"
+
+
+def load_prefs(project_root: Path) -> dict[str, str]:
+    """Load saved project preferences (user choices like locale dir, .env path).
+
+    Returns ``{key: value}`` — all values are strings (paths stored as strings).
+    """
+    path = _project_prefs_path(project_root)
+    if not path.is_file():
+        return {}
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        if isinstance(data, dict):
+            return data
+    except (json.JSONDecodeError, OSError):
+        pass
+    return {}
+
+
+def save_pref(project_root: Path, key: str, value: str) -> None:
+    """Save a single preference for this project.
+
+    Merges into existing prefs — does not overwrite other keys.
+    """
+    prefs = load_prefs(project_root)
+    prefs[key] = value
+    try:
+        _atomic_write_json(_project_prefs_path(project_root), prefs)
+    except OSError as exc:
+        log.debug("Could not save preference: %s", exc)
+
+
+def clear_pref(project_root: Path, key: str) -> None:
+    """Remove a saved preference."""
+    prefs = load_prefs(project_root)
+    if key in prefs:
+        del prefs[key]
+        try:
+            _atomic_write_json(_project_prefs_path(project_root), prefs)
+        except OSError:
+            pass
+
+
 # ── Cache info (for UI/debugging) ────────────────────────────────────
 
 

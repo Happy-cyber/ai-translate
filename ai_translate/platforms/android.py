@@ -38,20 +38,48 @@ def _get_element_text(elem: ET.Element) -> str:
     return "".join(parts).strip()
 
 
+_chosen_values_dir: Path | None = None
+
+
 def _find_source_values_dir(project_root: Path) -> Path | None:
-    """Find the English values/ directory."""
+    """Find the English values/ directory, prompting if multiple exist."""
+    global _chosen_values_dir
+
+    if _chosen_values_dir and _chosen_values_dir.is_dir():
+        return _chosen_values_dir
+
+    found: list[Path] = []
+
     standard = project_root / "app" / "src" / "main" / "res" / "values"
-    if standard.is_dir():
-        return standard
+    if standard.is_dir() and any(f.suffix == ".xml" for f in standard.iterdir()):
+        found.append(standard)
 
     for dirpath, dirs, _ in walk_project(project_root, extra_skip=_SOURCE_SKIP_DIRS):
         if "values" in dirs:
             candidate = dirpath / "values"
-            for f in candidate.iterdir():
-                if f.suffix == ".xml":
-                    return candidate
+            if candidate not in found:
+                try:
+                    if any(f.suffix == ".xml" for f in candidate.iterdir()):
+                        found.append(candidate)
+                except PermissionError:
+                    pass
 
-    return None
+    if not found:
+        return None
+
+    if len(found) == 1:
+        _chosen_values_dir = found[0]
+    else:
+        from ai_translate.cli.ui import prompt_choose_path
+        def _detail(p: Path) -> str:
+            count = sum(1 for f in p.iterdir() if f.suffix == ".xml")
+            return f"{count} XML files"
+        _chosen_values_dir = prompt_choose_path(
+            "Android values directory", found, detail_fn=_detail,
+            pref_key="android_values_dir", project_root=project_root,
+        )
+
+    return _chosen_values_dir
 
 
 def _parse_string_xmls(values_dir: Path) -> dict[str, str]:

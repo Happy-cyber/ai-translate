@@ -110,23 +110,57 @@ def scan_source(project_root: Path) -> dict[str, str]:
 # ── Language detection ────────────────────────────────────────────────
 
 
+_chosen_trans_dir: Path | None = None
+
+
 def _find_translations_dir(project_root: Path) -> Path:
-    """Find or create translations directory (Babel convention)."""
+    """Find translations directory, prompting user if multiple exist."""
+    global _chosen_trans_dir
+
+    if _chosen_trans_dir and _chosen_trans_dir.is_dir():
+        return _chosen_trans_dir
+
+    found: list[Path] = []
+
+    # Check root-level and one level deep
     for name in ("translations", "locale", "locales"):
         candidate = project_root / name
         if candidate.is_dir():
-            return candidate
+            found.append(candidate)
+        # Also check subdirectories (Flask app packages)
+        for child in project_root.iterdir() if project_root.is_dir() else []:
+            if child.is_dir() and child.name not in (
+                "venv", ".venv", "env", "node_modules", ".git",
+                "__pycache__", "static", "templates", "instance",
+            ):
+                sub = child / name
+                if sub.is_dir() and sub not in found:
+                    found.append(sub)
 
-    # Check babel.cfg for path
-    babel_cfg = project_root / "babel.cfg"
-    if babel_cfg.is_file():
-        content = babel_cfg.read_text(errors="ignore")
-        # Not strictly needed — just use default
-        pass
+    if not found:
+        translations = project_root / "translations"
+        translations.mkdir(parents=True, exist_ok=True)
+        _chosen_trans_dir = translations
+        return translations
 
-    translations = project_root / "translations"
-    translations.mkdir(parents=True, exist_ok=True)
-    return translations
+    # Filter to dirs that have .po files
+    with_po = [d for d in found if any(d.rglob("*.po"))]
+
+    if len(with_po) == 1:
+        _chosen_trans_dir = with_po[0]
+    elif len(with_po) > 1:
+        from ai_translate.cli.ui import prompt_choose_path
+        def _detail(p: Path) -> str:
+            count = sum(1 for _ in p.rglob("*.po"))
+            return f"{count} .po files"
+        _chosen_trans_dir = prompt_choose_path(
+            "translations directory", with_po, detail_fn=_detail,
+            pref_key="flask_translations_dir", project_root=project_root,
+        )
+    else:
+        _chosen_trans_dir = found[0]
+
+    return _chosen_trans_dir
 
 
 def detect_target_languages(project_root: Path) -> dict[str, str]:

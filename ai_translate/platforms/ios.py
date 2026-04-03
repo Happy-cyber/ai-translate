@@ -35,19 +35,70 @@ _JUNK = [
 # ── Format detection ──────────────────────────────────────────────────
 
 
+_chosen_ios_format: tuple[str, Path | None] | None = None
+
+
 def _detect_format(project_root: Path) -> tuple[str, Path | None]:
-    """Return ("xcstrings", path) or ("strings", lproj_parent) or ("unknown", None)."""
+    """Return ("xcstrings", path) or ("strings", lproj_parent) or ("unknown", None).
+
+    If multiple .xcstrings files or .lproj locations exist, prompts user.
+    """
+    global _chosen_ios_format
+
+    if _chosen_ios_format is not None:
+        return _chosen_ios_format
+
+    # Collect all .xcstrings files
+    xcstrings_files: list[Path] = []
     for dirpath, _, filenames in walk_project(project_root, extra_skip=_SWIFT_SKIP_DIRS):
         for f in filenames:
             if f.endswith(".xcstrings"):
-                return "xcstrings", dirpath / f
+                xcstrings_files.append(dirpath / f)
 
+    if xcstrings_files:
+        if len(xcstrings_files) == 1:
+            chosen = xcstrings_files[0]
+        else:
+            from ai_translate.cli.ui import prompt_choose_path
+            def _detail(p: Path) -> str:
+                try:
+                    import json
+                    data = json.loads(p.read_text())
+                    count = len(data.get("strings", {}))
+                    return f"{count} string keys"
+                except Exception:
+                    return ""
+            chosen = prompt_choose_path(
+                ".xcstrings file", xcstrings_files, detail_fn=_detail,
+                pref_key="ios_xcstrings_file", project_root=project_root,
+            )
+        _chosen_ios_format = ("xcstrings", chosen)
+        return _chosen_ios_format
+
+    # Collect all .lproj parent dirs
+    lproj_parents: list[Path] = []
     for dirpath, dirs, _ in walk_project(project_root, extra_skip=_SWIFT_SKIP_DIRS):
         for d in dirs:
-            if d.endswith(".lproj"):
-                return "strings", dirpath
+            if d.endswith(".lproj") and dirpath not in lproj_parents:
+                lproj_parents.append(dirpath)
 
-    return "unknown", None
+    if lproj_parents:
+        if len(lproj_parents) == 1:
+            chosen = lproj_parents[0]
+        else:
+            from ai_translate.cli.ui import prompt_choose_path
+            def _detail_lproj(p: Path) -> str:
+                count = sum(1 for d in p.iterdir() if d.name.endswith(".lproj"))
+                return f"{count} .lproj directories"
+            chosen = prompt_choose_path(
+                "iOS localization directory", lproj_parents, detail_fn=_detail_lproj,
+                pref_key="ios_lproj_dir", project_root=project_root,
+            )
+        _chosen_ios_format = ("strings", chosen)
+        return _chosen_ios_format
+
+    _chosen_ios_format = ("unknown", None)
+    return _chosen_ios_format
 
 
 # ── .strings parsing ──────────────────────────────────────────────────

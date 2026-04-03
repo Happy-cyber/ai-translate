@@ -3,7 +3,7 @@
 **Zero-config AI localization for developers. One command. Every platform.**
 
 ```bash
-pip install ai-translate
+pip install -U ai-translate
 cd your-project/
 ai-translate
 ```
@@ -47,7 +47,7 @@ The provider is auto-detected from your environment variables. If no key is foun
 
 ```bash
 # Core tool
-pip install ai-translate
+pip install -U ai-translate
 
 # With a specific provider
 pip install "ai-translate[claude]"
@@ -185,6 +185,7 @@ ai-translate --details                # Show comprehensive help guide
 | `--changed-only` | Only scan files changed since last run (uses `git diff`). |
 | `--quiet` | Zero output, exit code only. For CI/CD. |
 | `--json` | JSON output. For CI/CD pipelines that parse results. |
+| `--workers N` | Parallel translation workers (default: 4, max: 10). Speeds up large projects. |
 | `--batch-size N` | Override auto batch size (default: 10-25 based on string count). |
 | `--no-auto-install` | Don't auto-install missing provider SDKs. |
 | `--debug` | Verbose debug logging. |
@@ -201,14 +202,14 @@ ai-translate --estimate
 ```
 
 ```
-╭───────────────────────┬───────────┬───────────┬───────────╮
-│ Provider              │ Est. Cost │ Est. Time │  Quality  │
-├───────────────────────┼───────────┼───────────┼───────────┤
-│ Claude (Anthropic)    │   $0.0025 │   ~12s    │ Excellent │
-│ OpenAI GPT-4o         │   $0.0030 │   ~15s    │   High    │
-│ Google Gemini         │   $0.0001 │    ~6s    │   High    │
-│ DeepSeek (OpenRouter) │ $0.0000 * │    ~8s    │   Good    │
-╰───────────────────────┴───────────┴───────────┴───────────╯
+  Cost Estimate  │  42 strings × 10 languages
+
+  Provider                    Cost          Time     Quality
+  ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  Claude (Anthropic)        $0.0025         ~12s     Excellent
+  OpenAI GPT-4o             $0.0030         ~15s     High
+  Google Gemini             $0.0001 ← best  ~6s     High
+  DeepSeek (OpenRouter)     $0.0002          ~8s     Good
 ```
 
 ### Glossary (Consistent Terminology)
@@ -279,6 +280,56 @@ If your primary provider is down, the tool automatically tries the next availabl
 
 If Claude fails after 3 retries → OpenAI is tried → if that fails → Gemini is tried.
 
+**Runtime failover (v1.0.1):** If a provider breaks mid-translation (after batch 50 of 400), the tool detects 3 consecutive failures and automatically switches to the next working provider for the remaining batches — no restart needed.
+
+### Parallel Translation
+
+Speed up large projects with parallel workers:
+
+```bash
+ai-translate --workers 8       # 8 parallel workers (default: 4)
+```
+
+```
+Before:  400 batches × ~3s each = ~20 minutes (sequential)
+After:   400 batches ÷ 4 workers × ~3s = ~5 minutes (4x faster)
+```
+
+Quality stays the same — same prompts, same AI, just parallel.
+
+### Incremental Progress Saving
+
+The tool saves translation progress every 20 batches. If the tool crashes or is interrupted at batch 200 of 400, only the last ~20 batches are lost. Run again and it picks up from the cache.
+
+### Smart Path Detection
+
+When multiple `.env` files or locale directories exist in your project, the tool asks you to choose:
+
+```
+  △ Multiple locale directorys found. Please choose one:
+
+  [1]  /project/MyApp/locale     10 .po files, 13,520 translations
+  [2]  /project/locale           empty (no .po files)
+
+  ❯ Choose locale directory [1/2]: 1
+  ✓ Using: /project/MyApp/locale
+  › Choice saved — won't ask again for this project.
+```
+
+Your choice is saved per-project in `~/.ai-translate/projects/<hash>/prefs.json`. Next run uses it automatically.
+
+### Auto SDK Installation
+
+Missing provider SDKs are installed automatically with a progress spinner:
+
+```
+  › Auto-installing anthropic...
+  ⠋ Installing anthropic...
+  ✓ SDK for 'claude' installed successfully
+```
+
+Use `--no-auto-install` to disable this in CI/CD environments.
+
 ### Placeholder Validation
 
 After translation, the tool validates that all placeholders are preserved:
@@ -305,6 +356,7 @@ The tool stores ALL data in `~/.ai-translate/`. Nothing is written to your proje
 └── projects/
     ├── a1b2c3d4e5f6/
     │   ├── cache.json             ← Project-specific translations
+    │   ├── prefs.json             ← Saved user choices (locale dir, .env path)
     │   └── meta.json              ← Project path, platform, last run
     └── ...
 ```
@@ -340,7 +392,7 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
-      - run: pip install ai-translate
+      - run: pip install -U ai-translate
       - name: Translate
         run: ai-translate --quiet --provider claude
         env:
@@ -391,7 +443,7 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
-      - run: pip install ai-translate
+      - run: pip install -U ai-translate
       - name: Check translations
         run: |
           RESULT=$(ai-translate --json --provider skip)

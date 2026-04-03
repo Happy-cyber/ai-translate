@@ -18,7 +18,7 @@ _TOKEN_COSTS: dict[str, dict[str, float]] = {
     "openai": {"input": 0.005, "output": 0.015},
     "anthropic": {"input": 0.003, "output": 0.015},
     "google": {"input": 0.00025, "output": 0.0005},
-    "deepl": {"input": 0.00, "output": 0.00},  # flat-rate, not token-based
+    "deepseek": {"input": 0.00014, "output": 0.00028},  # DeepSeek via OpenRouter
 }
 
 # Average characters per token (rough estimate across providers)

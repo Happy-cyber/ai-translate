@@ -39,33 +39,58 @@ _JUNK = [
 
 
 def _discover_arb_files(project_root: Path) -> tuple[Path | None, Path | None]:
-    """Find (arb_dir, template_arb) by walking the project."""
+    """Find (arb_dir, template_arb) by walking the project.
+
+    If multiple directories with .arb files exist, prompts the user to choose.
+    """
+    arb_dirs: list[Path] = []
+    arb_dir_templates: dict[str, Path | None] = {}
+
     for dirpath, _, filenames in walk_project(project_root, extra_skip=_DART_SKIP_DIRS):
         arb_files = [f for f in filenames if f.endswith(".arb")]
         if not arb_files:
             continue
-        arb_dir = dirpath
 
-        # Find English template
+        arb_dirs.append(dirpath)
+        template = None
+
         for fname in arb_files:
-            fpath = arb_dir / fname
+            fpath = dirpath / fname
             try:
                 data = json.loads(fpath.read_text(encoding="utf-8"))
                 if data.get("@@locale") in _SOURCE_LOCALES:
-                    return arb_dir, fpath
+                    template = fpath
+                    break
             except (json.JSONDecodeError, OSError):
                 pass
 
-        for fname in arb_files:
-            if "_en." in fname or fname.startswith("app_en"):
-                return arb_dir, arb_dir / fname
+        if not template:
+            for fname in arb_files:
+                if "_en." in fname or fname.startswith("app_en"):
+                    template = dirpath / fname
+                    break
 
-        if len(arb_files) == 1:
-            return arb_dir, arb_dir / arb_files[0]
+        if not template and len(arb_files) == 1:
+            template = dirpath / arb_files[0]
 
-        return arb_dir, None
+        arb_dir_templates[str(dirpath)] = template
 
-    return None, None
+    if not arb_dirs:
+        return None, None
+
+    if len(arb_dirs) == 1:
+        chosen = arb_dirs[0]
+    else:
+        from ai_translate.cli.ui import prompt_choose_path
+        def _detail(p: Path) -> str:
+            count = sum(1 for f in p.iterdir() if f.suffix == ".arb")
+            return f"{count} .arb files"
+        chosen = prompt_choose_path(
+            "ARB directory", arb_dirs, detail_fn=_detail,
+            pref_key="flutter_arb_dir", project_root=project_root,
+        )
+
+    return chosen, arb_dir_templates.get(str(chosen))
 
 
 def _get_config(project_root: Path) -> tuple[Path | None, Path | None]:

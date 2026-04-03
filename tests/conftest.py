@@ -14,6 +14,42 @@ import pytest
 # ---------------------------------------------------------------------------
 
 
+@pytest.fixture(autouse=True)
+def _reset_platform_state():
+    """Reset cached platform choices between tests."""
+    yield
+    # Django
+    try:
+        from ai_translate.platforms.django import _reset_locale_choice
+        _reset_locale_choice()
+    except ImportError:
+        pass
+    # Android
+    try:
+        import ai_translate.platforms.android as andr
+        andr._chosen_values_dir = None
+    except (ImportError, AttributeError):
+        pass
+    # Flask/FastAPI
+    try:
+        import ai_translate.platforms.flask_fastapi as ff
+        ff._chosen_trans_dir = None
+    except (ImportError, AttributeError):
+        pass
+    # iOS
+    try:
+        import ai_translate.platforms.ios as iosp
+        iosp._chosen_ios_format = None
+    except (ImportError, AttributeError):
+        pass
+    # Env manager
+    try:
+        import ai_translate.services.env_manager as em
+        em._chosen_env = None
+    except (ImportError, AttributeError):
+        pass
+
+
 @pytest.fixture()
 def tmp_django_project(tmp_path: Path) -> Path:
     """Create a minimal Django project layout with translatable strings."""

@@ -61,16 +61,45 @@ def _get_sdk_install_hint(provider: str) -> str:
 
 
 def _auto_install_sdk(provider: str) -> bool:
+    """Auto-install missing SDK with visible progress."""
     _, pip_name = PROVIDER_SDK_MAP.get(provider, ("", ""))
     if not pip_name or pip_name not in _TRUSTED_PACKAGES:
         return False
+
+    ui.show_info(f"Auto-installing [bold]{pip_name}[/]...")
+
     try:
-        subprocess.run(
-            [sys.executable, "-m", "pip", "install", pip_name],
-            capture_output=True, timeout=120, check=True,
+        proc = subprocess.Popen(
+            [sys.executable, "-m", "pip", "install", "--quiet", pip_name],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
         )
-        return True
-    except Exception:
+
+        # Show a spinner while installing
+        from rich.progress import Progress, SpinnerColumn, TextColumn
+        with Progress(
+            SpinnerColumn("dots", style="bright_cyan"),
+            TextColumn(f"[bold bright_cyan]Installing {pip_name}...[/]"),
+            console=ui.console,
+            transient=True,
+        ) as progress:
+            progress.add_task("install", total=None)
+            stdout, stderr = proc.communicate(timeout=180)
+
+        if proc.returncode == 0:
+            return True
+
+        # Show last 3 lines of error
+        err_lines = stderr.strip().splitlines()
+        for line in err_lines[-3:]:
+            ui.show_error(f"  {line}")
+        return False
+
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        ui.show_error("Installation timed out after 3 minutes.")
+        return False
+    except Exception as exc:
+        ui.show_error(f"Installation failed: {exc}")
         return False
 
 
@@ -133,19 +162,30 @@ def _handle_interrupt(signum, frame) -> None:
 
 def _load_glossary(glossary_path: str | None, project_root: Path) -> dict | None:
     """Load glossary from explicit path or auto-discover in project root."""
+    def _try_load(p: Path) -> dict | None:
+        try:
+            with p.open("r", encoding="utf-8") as f:
+                data = json.load(f)
+            if isinstance(data, dict):
+                return data
+            log.warning("Glossary is not a JSON object: %s", p)
+            return None
+        except json.JSONDecodeError as exc:
+            log.warning("Glossary has invalid JSON: %s — %s", p, exc)
+            ui.show_warning(f"Glossary skipped (invalid JSON): {p}")
+            return None
+
     if glossary_path:
         p = Path(glossary_path)
         if p.is_file():
-            with p.open("r", encoding="utf-8") as f:
-                return json.load(f)
+            return _try_load(p)
         log.warning("Glossary file not found: %s", glossary_path)
         return None
 
     # Auto-discover
     auto_path = project_root / ".ai-translate-glossary.json"
     if auto_path.is_file():
-        with auto_path.open("r", encoding="utf-8") as f:
-            return json.load(f)
+        return _try_load(auto_path)
     return None
 
 
@@ -240,6 +280,10 @@ def build_parser() -> argparse.ArgumentParser:
         help="Project context for AI prompt",
     )
     parser.add_argument(
+        "--workers", type=int, default=4, metavar="N",
+        help="Parallel workers for translation (default: 4, max: 10)",
+    )
+    parser.add_argument(
         "--check", action="store_true",
         help="Regression detection mode",
     )
@@ -267,6 +311,7 @@ USAGE:
   ai-translate --check                  Detect translation drift
   ai-translate --quiet                  CI/CD mode (exit code only)
   ai-translate --json                   CI/CD mode (JSON output)
+  ai-translate --workers 8              Parallel translation (2-10 workers)
 
 PLATFORMS (auto-detected):
   Django        manage.py                      .po files
@@ -352,7 +397,10 @@ def _run(args: argparse.Namespace) -> None:
         return
 
     # ── Output mode must be set BEFORE any UI ────────────────────────
-    if args.quiet:
+    if args.quiet and args.json:
+        ui.show_error("Cannot use --quiet and --json together. Pick one.")
+        sys.exit(1)
+    elif args.quiet:
         ui.set_output_mode("quiet")
     elif args.json:
         ui.set_output_mode("json")
@@ -376,11 +424,17 @@ def _run(args: argparse.Namespace) -> None:
     ui.show_success(f"Platform detected: {ui.PLATFORM_ICONS.get(platform, platform)}")
 
     # ── STEP 2: ENVIRONMENT & PROVIDER SETUP ─────────────────────────
-    ui.show_step(2, "ENVIRONMENT SETUP")
+    if not args.estimate:
+        ui.show_step(2, "ENVIRONMENT SETUP")
 
+    # Load .env file (prompts user if multiple found, saves choice per project)
+    chosen_env = env_manager.load_env_file(project_root=project_root)
     env_manager.ensure_env_exists()
     key_status = env_manager.get_env_status()
-    ui.show_env_key_status(key_status, ALL_ENV_KEYS)
+    if not args.estimate:
+        if chosen_env:
+            ui.show_info(f"Env: {chosen_env}")
+        ui.show_env_key_status(key_status, ALL_ENV_KEYS)
 
     # ── Load glossary ────────────────────────────────────────────────
     glossary = _load_glossary(args.glossary, project_root)
@@ -393,7 +447,13 @@ def _run(args: argparse.Namespace) -> None:
     # ── Provider resolution: auto-detect → flag → interactive ────────
     detected_provider = auto_detect_provider(key_status)
 
-    if args.provider:
+    # --estimate is pure math — skip provider setup entirely
+    if args.estimate:
+        provider = "skip"
+        translator = get_translator("skip")
+        selected_model_id = ""
+        fallback_translators = []
+    elif args.provider:
         # User explicitly chose a provider via --provider flag
         provider = args.provider
         ui.show_info(f"Provider: {provider} (from --provider flag)")
@@ -434,19 +494,27 @@ def _run(args: argparse.Namespace) -> None:
 
     # ── SDK check + auto-install ──────────────────────────────────────
     if provider != "skip" and not _check_sdk_installed(provider):
+        hint = _get_sdk_install_hint(provider)
         if args.no_auto_install:
-            hint = _get_sdk_install_hint(provider)
-            ui.show_error(f"Required SDK not installed. Run: {hint}")
+            ui.show_error(
+                f"Required SDK not installed.\n\n"
+                f"  Run: [bold]{hint}[/]\n"
+                f"  Or use: [bold]pip install \"ai-translate[{provider}]\"[/]"
+            )
             sys.exit(1)
-        ui.show_info(f"Installing SDK for '{provider}'...")
         if _auto_install_sdk(provider):
             ui.show_success(f"SDK for '{provider}' installed successfully")
         else:
-            hint = _get_sdk_install_hint(provider)
-            ui.show_error(f"Failed to install SDK. Run manually: {hint}")
+            ui.show_error(
+                f"Could not install SDK automatically.\n\n"
+                f"  Install manually:\n"
+                f"  [bold]{hint}[/]\n\n"
+                f"  Or install ai-translate with the provider extra:\n"
+                f"  [bold]pip install \"ai-translate[{provider}]\"[/]"
+            )
             sys.exit(1)
 
-    # ── API key verification ──────────────────────────────────────────
+    # ── API key verification (with fallback to other providers) ─────
     if provider != "skip":
         env_var = PROVIDER_ENV_KEYS.get(provider, "")
         api_key = env_manager.load_key(env_var) if env_var else None
@@ -464,18 +532,54 @@ def _run(args: argparse.Namespace) -> None:
             ui.show_info(f"Validating API key for {translator.name}...")
             if translator.validate_key():
                 ui.show_success("API Key Verified")
-            else:
+            elif args.provider:
+                # User explicitly chose this provider — don't silently switch
                 ui.show_auth_failure(translator.name)
                 sys.exit(1)
+            else:
+                # Auto-detected provider failed — try others
+                ui.show_warning(f"API key validation failed for {translator.name}")
+
+                found_valid = False
+                for fallback_provider in PROVIDER_PRIORITY:
+                    if fallback_provider == provider:
+                        continue
+                    fb_env_var = PROVIDER_ENV_KEYS.get(fallback_provider, "")
+                    fb_key = key_status.get(fb_env_var)
+                    if not fb_key:
+                        continue
+                    if not _check_sdk_installed(fallback_provider):
+                        continue
+
+                    fb_model = "" if fallback_provider != "openrouter" else selected_model_id
+                    try:
+                        fb_translator = get_translator(fallback_provider, fb_key, model_id=fb_model)
+                    except Exception:
+                        continue
+
+                    ui.show_info(f"Trying {fb_translator.name}...")
+                    if fb_translator.validate_key():
+                        ui.show_success(f"Provider switched to {fb_translator.name} (key valid)")
+                        translator = fb_translator
+                        provider = fallback_provider
+                        found_valid = True
+                        break
+                    else:
+                        ui.show_warning(f"{fb_translator.name} key also invalid")
+
+                if not found_valid:
+                    ui.show_auth_failure(translator.name)
+                    sys.exit(1)
         else:
             ui.show_success("API Key Loaded (dry-run — skipping validation)")
     else:
         translator = get_translator("skip")
 
     # ── Build fallback translator chain ───────────────────────────────
-    fallback_translators = _build_fallback_translators(provider, key_status, selected_model_id)
-    if fallback_translators:
-        ui.show_info(f"Failover chain: {', '.join(fb.name for fb in fallback_translators)}")
+    if not args.estimate:
+        fallback_translators = _build_fallback_translators(provider, key_status, selected_model_id)
+        if fallback_translators:
+            ui.show_info(f"Failover chain: {', '.join(fb.name for fb in fallback_translators)}")
 
     # ── STEP 3: SCAN SOURCE STRINGS ──────────────────────────────────
     ui.show_step(3, "SCANNING SOURCE STRINGS")
@@ -484,7 +588,10 @@ def _run(args: argparse.Namespace) -> None:
     changed_files = None
     if args.changed_only:
         changed_files = _get_git_changed_files(project_root)
-        if changed_files is not None:
+        if changed_files is not None and len(changed_files) == 0:
+            ui.show_success("No files changed since last commit — nothing to translate.")
+            return
+        elif changed_files is not None:
             ui.show_info(f"Scanning {len(changed_files)} changed file(s) only")
         else:
             ui.show_warning("Could not determine changed files; scanning all")
@@ -549,10 +656,12 @@ def _run(args: argparse.Namespace) -> None:
             target_languages = filtered_langs
             ui.show_info(f"Filtered to {len(target_languages)} language(s): {', '.join(target_languages.keys())}")
         else:
-            ui.show_warning(
-                f"None of the specified languages ({args.lang}) found in project. "
-                f"Available: {', '.join(target_languages.keys())}"
+            ui.show_error(
+                f"None of the specified languages ({args.lang}) found in project.\n"
+                f"  Available: {', '.join(target_languages.keys())}\n"
+                f"  Use one of the available codes, e.g.: --lang {','.join(list(target_languages.keys())[:3])}"
             )
+            sys.exit(1)
 
     ui.show_platform_detected(
         platform=platform,
@@ -625,7 +734,7 @@ def _run(args: argparse.Namespace) -> None:
             "anthropic": ("Claude (Anthropic)", "~12s", "Excellent"),
             "openai": ("OpenAI GPT-4o", "~15s", "High"),
             "google": ("Google Gemini", "~6s", "High"),
-            "deepl": ("DeepSeek (OpenRouter)", "~8s", "Good"),
+            "deepseek": ("DeepSeek (OpenRouter)", "~8s", "Good"),
         }
         estimates = []
         for key, cost in cost_map.items():
@@ -726,6 +835,9 @@ def _run(args: argparse.Namespace) -> None:
     all_translations.update(cached_translations)
 
     if uncached_msgs and provider != "skip":
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+        import threading
+
         # Group by language set for efficient batching
         lang_groups: dict[tuple[str, ...], list[str]] = defaultdict(list)
         for msg in uncached_msgs:
@@ -736,29 +848,167 @@ def _run(args: argparse.Namespace) -> None:
         batch_size = args.batch_size if args.batch_size > 0 else _compute_batch_size(len(uncached_msgs))
         total_batches = sum(ceil(len(msgs) / batch_size) for msgs in lang_groups.values())
 
+        # ── Worker count ────────────────────────────────────────────
+        max_workers = max(1, min(args.workers, 10))
+        if total_batches <= 2:
+            max_workers = 1  # not worth parallelizing small jobs
+        if max_workers > 1:
+            ui.show_info(f"Parallel mode: {max_workers} workers, {total_batches} batches")
+
+        # ── Runtime failover state (shared across threads) ──────────
+        _fail_lock = threading.Lock()
+        _consecutive_failures = 0
+        _total_failures = 0
+        _MAX_CONSECUTIVE_FAILS = 3  # switch provider after 3 consecutive failures
+        _active_translator = translator
+        _active_provider_name = translator.name
+        _switched = False
+
+        # Events log — collected during translation, shown after progress bar
+        _events_lock = threading.Lock()
+        _events: list[tuple[str, str]] = []  # (level, message)
+
+        def _log_event(level: str, msg: str) -> None:
+            with _events_lock:
+                _events.append((level, msg))
+
+        def _translate_one_batch(batch, group_langs):
+            """Translate a single batch, with runtime failover."""
+            nonlocal _consecutive_failures, _total_failures
+            nonlocal _active_translator, _active_provider_name, _switched
+
+            current_translator = _active_translator
+            result = current_translator.translate_batch(
+                batch, group_langs, platform=platform,
+                glossary=glossary, context=project_context,
+                fallback_translators=fallback_translators,
+            )
+
+            if result:
+                with _fail_lock:
+                    _consecutive_failures = 0
+                return result
+
+            # Batch failed (primary + all fallbacks failed for this batch)
+            with _fail_lock:
+                _consecutive_failures += 1
+                _total_failures += 1
+                fail_count = _consecutive_failures
+
+                _log_event("warning", f"Batch failed ({current_translator.name}) — "
+                           f"{len(batch)} strings skipped [fail #{_total_failures}]")
+
+                if fail_count >= _MAX_CONSECUTIVE_FAILS and not _switched:
+                    # Try to switch the primary translator permanently
+                    _log_event("warning",
+                               f"{_active_provider_name} failed {fail_count} consecutive times — "
+                               "searching for working provider...")
+                    for fb in fallback_translators:
+                        try:
+                            if fb.validate_key():
+                                _log_event("success",
+                                           f"Provider switched: {_active_provider_name} → {fb.name}")
+                                _active_translator = fb
+                                _active_provider_name = fb.name
+                                _switched = True
+                                _consecutive_failures = 0
+                                break
+                            else:
+                                _log_event("warning", f"{fb.name} key invalid — skipping")
+                        except Exception:
+                            _log_event("warning", f"{fb.name} validation error — skipping")
+                            continue
+
+                    if not _switched:
+                        _log_event("error",
+                                   "No working provider found — remaining batches may fail")
+            return None
+
+        # ── Build flat list of (batch, group_langs) jobs ────────────
+        jobs: list[tuple[list[str], dict[str, str]]] = []
+        for lang_key, group_msgs in lang_groups.items():
+            group_langs = {lc: target_languages.get(lc, lc) for lc in lang_key}
+            for i in range(0, len(group_msgs), batch_size):
+                batch = group_msgs[i : i + batch_size]
+                jobs.append((batch, group_langs))
+
+        # ── Incremental cache save interval ─────────────────────────
+        _SAVE_EVERY = 20  # save progress every 20 batches
+        _results_lock = threading.Lock()
+        _batches_done = 0
+        _last_save_count = 0
+
+        def _maybe_save_cache():
+            """Incremental save — protects against crashes."""
+            nonlocal _last_save_count
+            if _batches_done > 0 and _batches_done % _SAVE_EVERY == 0 and _batches_done != _last_save_count:
+                _save_cache = cache_mod.update_cache(
+                    dict(project_cache), dict(all_translations)
+                )
+                cache_mod.save_cache(project_root, _save_cache, platform=platform)
+                _last_save_count = _batches_done
+                _log_event("info",
+                           f"Progress saved — {len(all_translations)} translations cached "
+                           f"[batch {_batches_done}/{total_batches}]")
+
         progress = ui.create_translation_progress()
         task = progress.add_task("translate", total=total_batches)
 
         with progress:
-            for lang_key, group_msgs in lang_groups.items():
-                if _interrupted:
-                    break
-                group_langs = {lc: target_languages.get(lc, lc) for lc in lang_key}
-
-                for i in range(0, len(group_msgs), batch_size):
+            if max_workers == 1:
+                # Sequential mode (simple, no threading overhead)
+                for batch, group_langs in jobs:
                     if _interrupted:
                         break
-                    batch = group_msgs[i : i + batch_size]
-                    result = translator.translate_batch(
-                        batch, group_langs, platform=platform,
-                        glossary=glossary, context=project_context,
-                        fallback_translators=fallback_translators,
-                    )
+                    result = _translate_one_batch(batch, group_langs)
                     if result:
-                        all_translations.update(result)
+                        with _results_lock:
+                            all_translations.update(result)
+                            _batches_done += 1
+                            _maybe_save_cache()
                     progress.advance(task)
+            else:
+                # Parallel mode
+                with ThreadPoolExecutor(max_workers=max_workers) as pool:
+                    future_map = {
+                        pool.submit(_translate_one_batch, batch, group_langs): idx
+                        for idx, (batch, group_langs) in enumerate(jobs)
+                    }
+                    for future in as_completed(future_map):
+                        if _interrupted:
+                            pool.shutdown(wait=False, cancel_futures=True)
+                            break
+                        result = future.result()
+                        if result:
+                            with _results_lock:
+                                all_translations.update(result)
+                                _batches_done += 1
+                                _maybe_save_cache()
+                        progress.advance(task)
 
-    # Update cache
+        # ── Show events that happened during translation ────────────
+        if _events:
+            ui.console.print()
+            for level, msg in _events:
+                if level == "success":
+                    ui.show_success(msg)
+                elif level == "warning":
+                    ui.show_warning(msg)
+                elif level == "error":
+                    ui.show_error(msg)
+                else:
+                    ui.show_info(msg)
+
+        # ── Summary of failures ─────────────────────────────────────
+        if _total_failures > 0:
+            ui.show_warning(
+                f"{_total_failures} batch(es) failed during translation. "
+                f"Run again to retry — cached translations won't be re-translated."
+            )
+        if _switched:
+            ui.show_info(f"Provider was switched to {_active_provider_name} during this run")
+
+    # Update cache (final save)
     if all_translations:
         project_cache = cache_mod.update_cache(project_cache, all_translations)
         cache_mod.save_cache(project_root, project_cache, platform=platform)
@@ -782,6 +1032,9 @@ def _run(args: argparse.Namespace) -> None:
     # ── Quality gate (--min-quality) ─────────────────────────────────
     approved_translations: dict[str, dict[str, str]] = {}
     fuzzy_translations: dict[str, dict[str, str]] = {}
+
+    if args.min_quality:
+        args.min_quality = max(0, min(100, args.min_quality))
 
     if args.min_quality and all_translations:
         scores = score_translations(translator, all_translations, list(all_translations.keys()), target_languages)
@@ -918,6 +1171,17 @@ def _run(args: argparse.Namespace) -> None:
 
 
 def main() -> None:
+    # Suppress noisy third-party warnings (gRPC, absl, protobuf)
+    import warnings
+    warnings.filterwarnings("ignore")
+    os.environ.setdefault("GRPC_VERBOSITY", "NONE")
+    os.environ.setdefault("GLOG_minloglevel", "3")
+    logging.getLogger("absl").setLevel(logging.CRITICAL)
+    logging.getLogger("grpc").setLevel(logging.CRITICAL)
+    logging.getLogger("google").setLevel(logging.CRITICAL)
+    logging.getLogger("urllib3").setLevel(logging.CRITICAL)
+    logging.getLogger("httpx").setLevel(logging.CRITICAL)
+
     parser = build_parser()
     args = parser.parse_args()
 
@@ -937,17 +1201,20 @@ def main() -> None:
         _run(args)
     except KeyboardInterrupt:
         ui.show_warning("Interrupted.")
+        ui._show_signoff()
         sys.exit(130)
     except SystemExit:
         raise
     except PermissionError as exc:
         ui.show_error(f"Permission denied: {exc.filename}")
+        ui._show_signoff()
         sys.exit(1)
     except Exception as exc:
         if args.debug:
             import traceback
             traceback.print_exc()
         ui.show_error(f"Unexpected error: {exc}")
+        ui._show_signoff()
         sys.exit(1)
     finally:
         _release_lock()
