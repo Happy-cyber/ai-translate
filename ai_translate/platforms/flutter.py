@@ -1,0 +1,252 @@
+"""Flutter platform handler — ARB file parsing + Dart source scanning."""
+
+from __future__ import annotations
+
+import json
+import logging
+import re
+from pathlib import Path
+
+from ai_translate.platforms import SKIP_DIRS, atomic_write_text, walk_project
+
+log = logging.getLogger(__name__)
+
+_SOURCE_LOCALES = {"en", "en_US", "en_GB"}
+
+_DART_SKIP_DIRS = frozenset({
+    "build", ".dart_tool", ".fvm", ".pub-cache",
+    "test", "integration_test", "generated", ".symlinks",
+})
+
+_DART_PATTERNS = [
+    re.compile(r'AppLocalizations\.of\(\w+\)\.(\w+)'),
+    re.compile(r'context\.l10n\.(\w+)'),
+    re.compile(r'"([^"]{2,})"\s*\.tr'),
+    re.compile(r"\btr\(\s*\"([^\"]{2,})\""),
+    re.compile(r'S\.of\(\w+\)\.(\w+)'),
+    re.compile(r'S\.current\.(\w+)'),
+    re.compile(r'LocaleKeys\.(\w+)'),
+]
+
+_JUNK = [
+    re.compile(r'^https?://'),
+    re.compile(r'^%[ds@]$'),
+    re.compile(r'^[a-z][a-zA-Z]+\.[a-z]'),
+]
+
+
+# ── ARB discovery ─────────────────────────────────────────────────────
+
+
+def _discover_arb_files(project_root: Path) -> tuple[Path | None, Path | None]:
+    """Find (arb_dir, template_arb) by walking the project."""
+    for dirpath, _, filenames in walk_project(project_root, extra_skip=_DART_SKIP_DIRS):
+        arb_files = [f for f in filenames if f.endswith(".arb")]
+        if not arb_files:
+            continue
+        arb_dir = dirpath
+
+        # Find English template
+        for fname in arb_files:
+            fpath = arb_dir / fname
+            try:
+                data = json.loads(fpath.read_text(encoding="utf-8"))
+                if data.get("@@locale") in _SOURCE_LOCALES:
+                    return arb_dir, fpath
+            except (json.JSONDecodeError, OSError):
+                pass
+
+        for fname in arb_files:
+            if "_en." in fname or fname.startswith("app_en"):
+                return arb_dir, arb_dir / fname
+
+        if len(arb_files) == 1:
+            return arb_dir, arb_dir / arb_files[0]
+
+        return arb_dir, None
+
+    return None, None
+
+
+def _get_config(project_root: Path) -> tuple[Path | None, Path | None]:
+    """Read l10n.yaml or auto-discover ARBs."""
+    l10n = project_root / "l10n.yaml"
+    if l10n.is_file():
+        try:
+            import yaml
+            cfg = yaml.safe_load(l10n.read_text()) or {}
+            arb_dir = project_root / cfg.get("arb-dir", "lib/l10n")
+            template = cfg.get("template-arb-file", "app_en.arb")
+            return arb_dir, arb_dir / template
+        except Exception:
+            pass
+
+    return _discover_arb_files(project_root)
+
+
+# ── Dart source scanner ──────────────────────────────────────────────
+
+
+def _scan_dart_sources(project_root: Path) -> dict[str, str]:
+    """Fallback: scan .dart files for localizable patterns."""
+    results: dict[str, str] = {}
+    skip = SKIP_DIRS | _DART_SKIP_DIRS
+
+    for dirpath, _, filenames in walk_project(project_root, extra_skip=skip):
+        for fname in filenames:
+            if not fname.endswith(".dart"):
+                continue
+            fpath = dirpath / fname
+            try:
+                content = fpath.read_text(encoding="utf-8", errors="ignore")
+            except OSError:
+                continue
+
+            for line in content.splitlines():
+                stripped = line.strip()
+                if stripped.startswith("//") or "print(" in stripped or "debugPrint(" in stripped:
+                    continue
+                for pat in _DART_PATTERNS:
+                    for match in pat.finditer(line):
+                        val = match.group(1)
+                        if any(j.search(val) for j in _JUNK):
+                            continue
+                        if len(val) >= 2:
+                            results[val] = val
+
+    return results
+
+
+# ── Public interface ──────────────────────────────────────────────────
+
+
+def scan_source(project_root: Path) -> dict[str, str]:
+    arb_dir, template = _get_config(project_root)
+
+    if template and template.is_file():
+        try:
+            data = json.loads(template.read_text(encoding="utf-8"))
+            strings: dict[str, str] = {}
+            for key, val in data.items():
+                if key.startswith("@"):
+                    continue
+                if isinstance(val, str) and len(val) >= 2:
+                    strings[key] = val
+            if strings:
+                return strings
+        except (json.JSONDecodeError, OSError):
+            pass
+
+    return _scan_dart_sources(project_root)
+
+
+def detect_target_languages(project_root: Path) -> dict[str, str]:
+    from ai_translate.cli.ui import COMMON_LANGUAGES
+
+    arb_dir, _ = _get_config(project_root)
+    langs: dict[str, str] = {}
+
+    if arb_dir and arb_dir.is_dir():
+        for f in sorted(arb_dir.iterdir()):
+            if not f.name.endswith(".arb"):
+                continue
+            try:
+                data = json.loads(f.read_text(encoding="utf-8"))
+                locale = data.get("@@locale", "")
+            except (json.JSONDecodeError, OSError):
+                locale = ""
+
+            if not locale:
+                m = re.search(r"_([a-z]{2}(?:_[A-Z]{2})?)\.arb$", f.name)
+                if m:
+                    locale = m.group(1)
+
+            if locale and locale not in _SOURCE_LOCALES:
+                langs[locale] = COMMON_LANGUAGES.get(locale, locale)
+
+    return langs
+
+
+def get_missing_translations(
+    project_root: Path,
+    source_strings: dict[str, str],
+    target_languages: dict[str, str],
+) -> dict[str, list[str]]:
+    arb_dir, _ = _get_config(project_root)
+    missing: dict[str, list[str]] = {}
+
+    for lang_code in target_languages:
+        existing_keys: set[str] = set()
+        if arb_dir:
+            for f in arb_dir.iterdir():
+                if not f.name.endswith(".arb"):
+                    continue
+                locale_match = re.search(r"_([a-z]{2}(?:_[A-Z]{2})?)\.arb$", f.name)
+                if locale_match and locale_match.group(1) == lang_code:
+                    try:
+                        data = json.loads(f.read_text(encoding="utf-8"))
+                        for k, v in data.items():
+                            if not k.startswith("@") and isinstance(v, str) and v.strip():
+                                existing_keys.add(k)
+                    except (json.JSONDecodeError, OSError):
+                        pass
+
+        lang_missing = [k for k in source_strings if k not in existing_keys]
+        if lang_missing:
+            missing[lang_code] = lang_missing
+
+    return missing
+
+
+def write_translations(
+    project_root: Path,
+    translations: dict[str, dict[str, str]],
+    source_strings: dict[str, str],
+) -> dict[str, int]:
+    arb_dir, template = _get_config(project_root)
+    if not arb_dir:
+        arb_dir = project_root / "lib" / "l10n"
+    arb_dir.mkdir(parents=True, exist_ok=True)
+
+    stats: dict[str, int] = {}
+    all_langs: set[str] = set()
+    for lang_map in translations.values():
+        all_langs.update(lang_map.keys())
+
+    for lang_code in sorted(all_langs):
+        # Find or create target ARB file
+        target_name = f"app_{lang_code}.arb"
+        if template:
+            prefix = template.stem.rsplit("_", 1)[0]
+            target_name = f"{prefix}_{lang_code}.arb"
+
+        target_path = arb_dir / target_name
+        existing: dict[str, object] = {}
+        if target_path.is_file():
+            try:
+                existing = json.loads(target_path.read_text(encoding="utf-8"))
+            except (json.JSONDecodeError, OSError):
+                pass
+
+        added = 0
+        for source_key, lang_map in translations.items():
+            translated = lang_map.get(lang_code)
+            if not translated:
+                continue
+            if source_key in existing and existing[source_key]:
+                continue
+            existing[source_key] = translated
+            added += 1
+
+        existing["@@locale"] = lang_code
+
+        content = json.dumps(existing, ensure_ascii=False, indent=2) + "\n"
+        atomic_write_text(target_path, content)
+        stats[lang_code] = added
+
+    return stats
+
+
+def compile_messages(project_root: Path) -> bool:
+    """No compilation needed for this platform."""
+    return True
