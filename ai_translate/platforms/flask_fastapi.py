@@ -92,12 +92,12 @@ def scan_source(project_root: Path) -> dict[str, str]:
     # Also scan Jinja2 templates for _("...")
     for dirpath, _, filenames in walk_project(project_root, extra_skip=SKIP_DIRS):
         for fname in filenames:
-            if not fname.endswith((".html", ".jinja2", ".j2", ".txt")):
+            if not fname.endswith((".html", ".jinja2", ".j2", ".jinja", ".txt")):
                 continue
             fpath = dirpath / fname
             try:
                 content = fpath.read_text(encoding="utf-8", errors="ignore")
-                for m in re.finditer(r'_\(\s*["\'](.+?)["\']', content):
+                for m in re.finditer(r'_\(\s*["\'](.+?)["\']', content, re.DOTALL):
                     msg = m.group(1).strip()
                     if msg and not should_skip_message(msg):
                         messages[msg] = msg
@@ -164,19 +164,167 @@ def _find_translations_dir(project_root: Path) -> Path:
 
 
 def detect_target_languages(project_root: Path) -> dict[str, str]:
-    """Detect languages from translations/ subdirectories."""
-    from ai_translate.cli.ui import COMMON_LANGUAGES
+    """Detect languages — config files first, then translations/ directory.
 
-    trans_dir = _find_translations_dir(project_root)
+    Priority:
+      1. LANGUAGES/SUPPORTED_LANGUAGES in config files — user's explicit config
+      2. translations/ dirs with actual .po files — real translation work
+      3. translations/ dirs with LC_MESSAGES/ but no .po — scaffolded but empty
+    """
+    from ai_translate.cli.ui import COMMON_LANGUAGES
+    import re
+
+    # ── Priority 1: Check config files for LANGUAGES setting ─────────
     langs: dict[str, str] = {}
+    _CONFIG_NAMES = frozenset({
+        "config.py", "settings.py", "base.py", "app.py",
+        "__init__.py", "common.py", "defaults.py",
+    })
+    for dirpath, _, filenames in walk_project(project_root):
+        for fname in filenames:
+            if fname not in _CONFIG_NAMES:
+                continue
+            try:
+                content = (dirpath / fname).read_text(errors="ignore")
+                lang_block = re.search(
+                    r"(?:LANGUAGES|SUPPORTED_LANGUAGES|BABEL_LANGUAGES)\s*=\s*\[(.+?)\]",
+                    content, re.MULTILINE | re.DOTALL,
+                )
+                if not lang_block:
+                    continue
+                for m in re.finditer(r"['\"]([a-z]{2}(?:-[a-zA-Z]+)?)['\"]", lang_block.group(1)):
+                    code = m.group(1)
+                    if code not in ("en", "en-us"):
+                        langs[code] = COMMON_LANGUAGES.get(code, code)
+                if langs:
+                    return langs
+            except OSError:
+                pass
+
+    # ── Priority 2: Scan translations/ for dirs with actual .po files ─
+    trans_dir = _find_translations_dir(project_root)
+    dirs_with_po: dict[str, str] = {}
+    dirs_with_lc: dict[str, str] = {}
 
     if trans_dir.is_dir():
         for child in sorted(trans_dir.iterdir()):
             if child.is_dir() and child.name not in ("en", "en_US"):
+                has_lc = (child / "LC_MESSAGES").is_dir()
+                has_po = has_lc and any((child / "LC_MESSAGES").glob("*.po"))
                 code = child.name
-                langs[code] = COMMON_LANGUAGES.get(code, code)
+                name = COMMON_LANGUAGES.get(code, code)
+                if has_po:
+                    dirs_with_po[code] = name
+                elif has_lc:
+                    dirs_with_lc[code] = name
 
-    return langs
+    return dirs_with_po
+
+
+def scaffold_languages(
+    project_root: Path, languages: dict[str, str],
+) -> list[str]:
+    """Create translations/<lang>/LC_MESSAGES/messages.po for each language."""
+    trans_dir = _find_translations_dir(project_root)
+    scaffolded: list[str] = []
+    for code in languages:
+        po_file = _po_path(trans_dir, code)
+        if not po_file.is_file():
+            po_file.parent.mkdir(parents=True, exist_ok=True)
+            po = ensure_po(po_file, code)
+            atomic_save_po(po, po_file)
+            scaffolded.append(code)
+    return scaffolded
+
+
+def update_language_config(
+    project_root: Path, languages: dict[str, str],
+) -> list[str]:
+    """Add new languages to LANGUAGES/SUPPORTED_LANGUAGES in Flask/FastAPI config.
+
+    Preserves existing languages — only adds codes not already present.
+    Returns list of language codes added to the config.
+    """
+    import re
+    from ai_translate.cli.ui import COMMON_LANGUAGES
+
+    _CONFIG_NAMES = frozenset({
+        "config.py", "settings.py", "base.py", "app.py",
+        "__init__.py", "common.py", "defaults.py",
+    })
+
+    target_file: Path | None = None
+    existing_codes: set[str] = {"en", "en-us"}
+
+    # Find config file with LANGUAGES variable
+    for dirpath, _, filenames in walk_project(project_root):
+        for fname in filenames:
+            if fname not in _CONFIG_NAMES:
+                continue
+            fpath = dirpath / fname
+            try:
+                content = fpath.read_text(errors="ignore")
+                lang_match = re.search(
+                    r"(?:LANGUAGES|SUPPORTED_LANGUAGES|BABEL_LANGUAGES)\s*=\s*\[(.+?)\]",
+                    content, re.MULTILINE | re.DOTALL,
+                )
+                if lang_match:
+                    target_file = fpath
+                    for m in re.finditer(r"['\"]([a-z]{2}(?:-[a-zA-Z]+)?)['\"]", lang_match.group(1)):
+                        existing_codes.add(m.group(1))
+                    break
+            except OSError:
+                continue
+        if target_file:
+            break
+
+    # If no config file with LANGUAGES, try to find main config file
+    if not target_file:
+        for dirpath, _, filenames in walk_project(project_root):
+            for fname in ("config.py", "settings.py", "app.py"):
+                if fname in filenames:
+                    target_file = dirpath / fname
+                    break
+            if target_file:
+                break
+
+    if not target_file:
+        return []
+
+    new_codes = [code for code in languages if code not in existing_codes]
+    if not new_codes:
+        return []
+
+    try:
+        content = target_file.read_text(errors="ignore")
+    except OSError:
+        return []
+
+    lang_match = re.search(
+        r"((?:LANGUAGES|SUPPORTED_LANGUAGES|BABEL_LANGUAGES)\s*=\s*\[)(.+?)(\])",
+        content, re.MULTILINE | re.DOTALL,
+    )
+
+    new_entries = ", ".join(f"'{code}'" for code in new_codes)
+
+    if lang_match:
+        # Insert new codes before closing ]
+        block = lang_match.group(2).rstrip()
+        if block and not block.rstrip().endswith(","):
+            block += ","
+        updated = content[:lang_match.start(2)] + block + " " + new_entries + content[lang_match.end(2):]
+    else:
+        # Add new SUPPORTED_LANGUAGES variable
+        all_codes = ["'en'"] + [f"'{code}'" for code in new_codes]
+        languages_block = f"\nSUPPORTED_LANGUAGES = [{', '.join(all_codes)}]\n"
+        updated = content.rstrip() + "\n" + languages_block
+
+    try:
+        target_file.write_text(updated, encoding="utf-8")
+    except OSError:
+        return []
+
+    return new_codes
 
 
 # ── PO file management ────────────────────────────────────────────────
@@ -209,8 +357,8 @@ def get_missing_translations(
                             existing.add(encode_plural(entry.msgid, entry.msgid_plural))
                     elif entry.msgstr and entry.msgstr.strip():
                         existing.add(entry.msgid)
-            except Exception:
-                pass
+            except Exception as exc:
+                log.debug("Could not parse PO file %s: %s", path, exc)
         lang_missing = [msg for msg in source_strings if msg not in existing]
         if lang_missing:
             missing[lang_code] = lang_missing

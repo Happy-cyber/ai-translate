@@ -83,15 +83,36 @@ def _detect_format(project_root: Path) -> tuple[str, Path | None]:
                 lproj_parents.append(dirpath)
 
     if lproj_parents:
-        if len(lproj_parents) == 1:
-            chosen = lproj_parents[0]
+        # Filter to only dirs with actual .strings files inside .lproj subdirs
+        with_strings = []
+        for parent in lproj_parents:
+            strings_count = 0
+            for lproj_dir in parent.iterdir():
+                if lproj_dir.is_dir() and lproj_dir.name.endswith(".lproj"):
+                    strings_count += sum(1 for _ in lproj_dir.glob("*.strings"))
+            if strings_count > 0:
+                with_strings.append((parent, strings_count))
+
+        if with_strings:
+            # Sort by .strings file count (most files = best candidate)
+            with_strings.sort(key=lambda x: x[1], reverse=True)
+            candidates = [p for p, _ in with_strings]
+        else:
+            candidates = lproj_parents
+
+        if len(candidates) == 1:
+            chosen = candidates[0]
         else:
             from ai_translate.cli.ui import prompt_choose_path
             def _detail_lproj(p: Path) -> str:
                 count = sum(1 for d in p.iterdir() if d.name.endswith(".lproj"))
-                return f"{count} .lproj directories"
+                strings = sum(
+                    sum(1 for _ in d.glob("*.strings"))
+                    for d in p.iterdir() if d.is_dir() and d.name.endswith(".lproj")
+                )
+                return f"{count} .lproj dirs, {strings} .strings files"
             chosen = prompt_choose_path(
-                "iOS localization directory", lproj_parents, detail_fn=_detail_lproj,
+                "iOS localization directory", candidates, detail_fn=_detail_lproj,
                 pref_key="ios_lproj_dir", project_root=project_root,
             )
         _chosen_ios_format = ("strings", chosen)
@@ -105,10 +126,45 @@ def _detect_format(project_root: Path) -> tuple[str, Path | None]:
 
 
 def _parse_strings_file(path: Path) -> dict[str, str]:
+    """Parse a .strings file, handling UTF-8, UTF-16LE, and UTF-16BE encodings.
+
+    Apple .strings files can be in any of these encodings.
+    We try UTF-8 first, then fall back to UTF-16.
+    """
     try:
-        content = path.read_text(encoding="utf-8", errors="ignore")
+        raw = path.read_bytes()
     except OSError:
         return {}
+
+    # Detect encoding from BOM or try multiple
+    content = ""
+    if raw[:2] in (b"\xff\xfe", b"\xfe\xff"):
+        # Has BOM — UTF-16
+        try:
+            content = raw.decode("utf-16")
+        except (UnicodeDecodeError, ValueError):
+            content = raw.decode("utf-8", errors="ignore")
+    else:
+        # Try UTF-8 first, then UTF-16LE (common Apple default without BOM)
+        try:
+            content = raw.decode("utf-8")
+            # Verify it actually parsed (UTF-16 read as UTF-8 produces garbage)
+            if content and _STRINGS_RE.search(content):
+                pass  # UTF-8 worked
+            else:
+                # Try UTF-16LE
+                try:
+                    alt = raw.decode("utf-16-le")
+                    if _STRINGS_RE.search(alt):
+                        content = alt
+                except (UnicodeDecodeError, ValueError):
+                    pass
+        except UnicodeDecodeError:
+            try:
+                content = raw.decode("utf-16")
+            except (UnicodeDecodeError, ValueError):
+                content = raw.decode("latin-1")
+
     return dict(_STRINGS_RE.findall(content))
 
 
@@ -118,7 +174,14 @@ def _escape_strings_value(value: str) -> str:
 
 def _write_strings_file(path: Path, entries: dict[str, str]) -> None:
     lines = [f'"{k}" = "{_escape_strings_value(v)}";' for k, v in sorted(entries.items())]
-    atomic_write_text(path, "\n".join(lines) + "\n")
+
+    def _validate_strings(tmp: Path) -> None:
+        content = tmp.read_text(encoding="utf-8")
+        found = _STRINGS_RE.findall(content)
+        if len(entries) > 0 and len(found) == 0:
+            raise ValueError(f"Invalid .strings: wrote {len(entries)} entries but none parse back")
+
+    atomic_write_text(path, "\n".join(lines) + "\n", validate=_validate_strings)
 
 
 # ── .xcstrings parsing ───────────────────────────────────────────────
@@ -229,11 +292,20 @@ def scan_source(project_root: Path) -> dict[str, str]:
 
 
 def detect_target_languages(project_root: Path) -> dict[str, str]:
+    """Detect languages — xcodeproj/xcstrings config first, then .lproj dirs.
+
+    Priority:
+      1. .xcstrings JSON localizations — embedded config
+      2. .xcodeproj knownRegions — Xcode project config
+      3. .lproj dirs with actual .strings files — real translations
+      4. .lproj empty dirs — scaffolded but empty
+    """
     from ai_translate.cli.ui import COMMON_LANGUAGES
 
     fmt, path = _detect_format(project_root)
     langs: dict[str, str] = {}
 
+    # ── Priority 1: xcstrings JSON localizations ─────────────────────
     if fmt == "xcstrings" and path:
         data = _parse_xcstrings(path)
         source = data.get("sourceLanguage", "en")
@@ -242,19 +314,150 @@ def detect_target_languages(project_root: Path) -> dict[str, str]:
                 if lc != source:
                     langs[lc] = COMMON_LANGUAGES.get(lc, lc)
             break  # Only need first entry to get all locale keys
+        if langs:
+            return langs
 
+    # ── Priority 2: Xcode project knownRegions ───────────────────────
+    xcode_langs: dict[str, str] = {}
+    for code in _detect_languages_from_xcodeproj(project_root):
+        xcode_langs[code] = COMMON_LANGUAGES.get(code, code)
+    if xcode_langs:
+        return xcode_langs
+
+    # ── Priority 3 & 4: .lproj directories ───────────────────────────
     if fmt == "strings" and path:
+        dirs_with_strings: dict[str, str] = {}
+        dirs_empty: dict[str, str] = {}
         for child in sorted(path.iterdir()):
             if child.is_dir() and child.name.endswith(".lproj"):
                 code = child.name.replace(".lproj", "")
                 if code not in ("en", "Base"):
-                    langs[code] = COMMON_LANGUAGES.get(code, code)
-
-    if not langs:
-        for code in _detect_languages_from_xcodeproj(project_root):
-            langs[code] = COMMON_LANGUAGES.get(code, code)
+                    name = COMMON_LANGUAGES.get(code, code)
+                    if any(child.glob("*.strings")):
+                        dirs_with_strings[code] = name
+                    else:
+                        dirs_empty[code] = name
+        if dirs_with_strings:
+            return dirs_with_strings
 
     return langs
+
+
+def scaffold_languages(
+    project_root: Path, languages: dict[str, str],
+) -> list[str]:
+    """Create .lproj directories for each language (strings format).
+
+    For xcstrings format, no scaffolding needed — languages are added
+    inside the JSON file when translations are written.
+    """
+    fmt, path = _detect_format(project_root)
+    scaffolded: list[str] = []
+
+    if fmt == "xcstrings" and path:
+        # xcstrings: add empty localizations for each language in the JSON
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+            strings_data = data.get("strings", {})
+            changed = False
+            for code in languages:
+                # Add locale to at least one key so it's detected next time
+                for key, info in strings_data.items():
+                    locs = info.setdefault("localizations", {})
+                    if code not in locs:
+                        locs[code] = {"stringUnit": {"state": "new", "value": ""}}
+                        changed = True
+                    break  # Only need first key
+                scaffolded.append(code)
+            if changed:
+                atomic_write_text(path, json.dumps(data, indent=2, ensure_ascii=False) + "\n")
+        except (json.JSONDecodeError, OSError) as exc:
+            log.warning("Could not scaffold xcstrings languages: %s", exc)
+
+    elif fmt == "strings" and path:
+        # .strings format: create <lang>.lproj/Localizable.strings
+        for code in languages:
+            lproj = path / f"{code}.lproj"
+            strings_file = lproj / "Localizable.strings"
+            if not strings_file.is_file():
+                lproj.mkdir(parents=True, exist_ok=True)
+                atomic_write_text(strings_file, "/* Auto-generated by ai-translate */\n")
+                scaffolded.append(code)
+
+    else:
+        # Unknown format — create .lproj/Localizable.strings at project root
+        for code in languages:
+            lproj = project_root / f"{code}.lproj"
+            strings_file = lproj / "Localizable.strings"
+            if not strings_file.is_file():
+                lproj.mkdir(parents=True, exist_ok=True)
+                atomic_write_text(strings_file, "/* Auto-generated by ai-translate */\n")
+                scaffolded.append(code)
+
+    return scaffolded
+
+
+def update_language_config(
+    project_root: Path, languages: dict[str, str],
+) -> list[str]:
+    """Add new languages to knownRegions in .xcodeproj/project.pbxproj.
+
+    Preserves existing regions — only adds codes not already present.
+    Returns list of language codes added.
+    """
+    # Find project.pbxproj
+    pbxproj: Path | None = None
+    for child in project_root.iterdir():
+        if child.name.endswith(".xcodeproj") and child.is_dir():
+            candidate = child / "project.pbxproj"
+            if candidate.is_file():
+                pbxproj = candidate
+                break
+
+    if not pbxproj:
+        return []
+
+    try:
+        content = pbxproj.read_text(errors="ignore")
+    except OSError:
+        return []
+
+    # Parse existing knownRegions
+    existing_codes: set[str] = {"en", "Base"}
+    kr_match = re.search(
+        r"(knownRegions\s*=\s*\()(.+?)(\))",
+        content, re.DOTALL,
+    )
+    if kr_match:
+        for m in re.finditer(r"\b([a-zA-Z]{2}(?:-[a-zA-Z]+)?)\b", kr_match.group(2)):
+            existing_codes.add(m.group(1))
+
+    new_codes = [code for code in languages if code not in existing_codes]
+    if not new_codes:
+        return []
+
+    if kr_match:
+        # Append new regions before closing )
+        block = kr_match.group(2).rstrip()
+        # Detect indentation style
+        indent = "\t\t\t\t"
+        lines = block.strip().split("\n")
+        if lines:
+            m = re.match(r"(\s+)", lines[0])
+            if m:
+                indent = m.group(1)
+        new_entries = "".join(f"{indent}{code},\n" for code in new_codes)
+        # Insert before closing )
+        updated = content[:kr_match.end(2)] + new_entries + content[kr_match.end(2):]
+    else:
+        return []  # No knownRegions found — don't modify pbxproj blindly
+
+    try:
+        pbxproj.write_text(updated, encoding="utf-8")
+    except OSError:
+        return []
+
+    return new_codes
 
 
 def get_missing_translations(
@@ -353,7 +556,13 @@ def write_translations(
                 stats[lang_code] = stats.get(lang_code, 0) + 1
 
         content = json.dumps(data, ensure_ascii=False, indent=2) + "\n"
-        atomic_write_text(path, content)
+
+        def _validate_xcstrings(tmp: Path) -> None:
+            d = json.loads(tmp.read_text(encoding="utf-8"))
+            if "strings" not in d:
+                raise ValueError("Invalid .xcstrings: missing 'strings' key")
+
+        atomic_write_text(path, content, validate=_validate_xcstrings)
 
     else:
         # .strings format

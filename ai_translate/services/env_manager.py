@@ -79,15 +79,28 @@ def _find_all_env_files() -> list[Path]:
         if (parent / ".git").exists():
             break
 
-    # 2. Also check immediate subdirectories of cwd
-    #    (catches Django patterns like project_root/MyApp/.env)
+    # 2. Scan subdirectories up to 2 levels deep
+    #    (catches Django patterns like project_root/MyApp/.env,
+    #     and project_root/config/settings/.env)
     if cwd.is_dir():
         try:
             for child in cwd.iterdir():
-                if child.is_dir() and child.name not in _SKIP_SUBDIRS:
-                    sub_env = child / ".env"
-                    if sub_env.is_file() and sub_env not in found:
-                        found.append(sub_env)
+                if not child.is_dir() or child.name in _SKIP_SUBDIRS:
+                    continue
+                # Level 1: project_root/MyApp/.env
+                sub_env = child / ".env"
+                if sub_env.is_file() and sub_env not in found:
+                    found.append(sub_env)
+                # Level 2: project_root/config/settings/.env
+                try:
+                    for grandchild in child.iterdir():
+                        if not grandchild.is_dir() or grandchild.name in _SKIP_SUBDIRS:
+                            continue
+                        deep_env = grandchild / ".env"
+                        if deep_env.is_file() and deep_env not in found:
+                            found.append(deep_env)
+                except PermissionError:
+                    pass
         except PermissionError:
             pass
 
@@ -217,7 +230,7 @@ def load_key(env_var: str) -> str | None:
 
 
 def save_key(env_var: str, value: str) -> None:
-    """Persist *value* for *env_var* into the project root .env file."""
+    """Persist *value* for *env_var* into the user's chosen .env file."""
     value = value.strip()
     if not value:
         return

@@ -120,7 +120,7 @@ ai-translate
      ├── Step 1: Detect platform (Django/Flask/FastAPI/Flutter/Android/iOS)
      ├── Step 2: Load environment + API key
      ├── Step 3: Scan source code for translatable strings
-     ├── Step 4: Detect target languages from locale files
+     ├── Step 4: Detect target languages (config first, then locale files)
      ├── Step 5: Find missing translations
      ├── Step 6: Translate via AI (with caching, batching, retry)
      ├── Step 7: Write translations to locale files (atomic writes)
@@ -156,6 +156,31 @@ ngettext("%(count)d item", "%(count)d items", count)  # plurals
 NSLocalizedString("Welcome", comment: "")
 ```
 
+### Language Detection Priority (v1.0.2)
+
+Each platform detects languages using a priority system — **project config is always checked first**, then locale files:
+
+| Platform | Priority 1 (Config) | Priority 2 (Files) |
+|----------|--------------------|--------------------|
+| **Django** | `LANGUAGES` in `settings.py` | `locale/*/LC_MESSAGES/*.po` files |
+| **Flask/FastAPI** | `LANGUAGES` / `SUPPORTED_LANGUAGES` in config | `translations/*/LC_MESSAGES/*.po` files |
+| **Flutter** | `@@locale` in `.arb` files | — (ARB files ARE the config) |
+| **Android** | `resConfigs` in `build.gradle` | `res/values-*/strings.xml` files |
+| **iOS** | `.xcstrings` JSON / `.xcodeproj` knownRegions | `.lproj/` dirs with `.strings` files |
+
+This ensures the tool respects your project's explicit language configuration rather than guessing from directory structure.
+
+### Input Validation (v1.0.2)
+
+All user inputs are validated before the pipeline starts:
+
+| Flag | Validation | Error Example |
+|------|-----------|---------------|
+| `--lang` | ISO 639 format (e.g., `es`, `zh-TW`, `pt-BR`) | `Invalid language code: 'zzzz'` |
+| `--workers` | Must be 1-10 | `--workers must be between 1 and 10` |
+| `--batch-size` | Must be >= 0 | `--batch-size must be non-negative` |
+| `--min-quality` | Must be 0-100 | `--min-quality must be between 0 and 100` |
+
 ## CLI Reference
 
 ### Basic Usage
@@ -178,7 +203,7 @@ ai-translate --details                # Show comprehensive help guide
 | `--estimate` | Show cost comparison across all providers, then exit. |
 | `--review` | Interactive review: accept, edit, or skip each translation before writing. |
 | `--min-quality N` | Quality gate (0-100). Translations below threshold marked as fuzzy. |
-| `--lang CODES` | Translate only specific languages: `--lang es,fr,de` |
+| `--lang CODES` | Translate specific languages: `--lang es,fr,de`. Auto-creates locale structure + updates config. |
 | `--glossary PATH` | Path to glossary JSON for consistent terminology. |
 | `--context TEXT` | Project context injected into AI prompt: `--context "medical app"` |
 | `--check` | Regression detection: re-translate cached strings, flag any drift. |
@@ -281,6 +306,32 @@ If your primary provider is down, the tool automatically tries the next availabl
 If Claude fails after 3 retries → OpenAI is tried → if that fails → Gemini is tried.
 
 **Runtime failover (v1.0.1):** If a provider breaks mid-translation (after batch 50 of 400), the tool detects 3 consecutive failures and automatically switches to the next working provider for the remaining batches — no restart needed.
+
+### Auto Language Setup (v1.0.2)
+
+When no target languages are detected, the tool guides you through setup and automatically configures your project:
+
+```bash
+ai-translate --lang es,fr,de
+```
+
+```
+  ✓ Created language structure for: es, fr, de
+  ✓ Updated project config with: es, fr, de
+```
+
+What happens per platform:
+
+| Platform | Files Created | Config Updated |
+|----------|--------------|----------------|
+| **Django** | `locale/<lang>/LC_MESSAGES/django.po` | `LANGUAGES` in `settings.py` |
+| **Flask/FastAPI** | `translations/<lang>/LC_MESSAGES/messages.po` | `SUPPORTED_LANGUAGES` in config |
+| **Flutter** | `lib/l10n/app_<lang>.arb` | ARB files ARE the config |
+| **Android** | `res/values-<lang>/strings.xml` | `resConfigs` in `build.gradle` |
+| **iOS (.strings)** | `<lang>.lproj/Localizable.strings` | `knownRegions` in `.xcodeproj` |
+| **iOS (.xcstrings)** | Locale entries in JSON | `knownRegions` in `.xcodeproj` |
+
+Existing languages are never removed or duplicated — only new codes are added.
 
 ### Parallel Translation
 
@@ -608,8 +659,10 @@ The only non-locale file created is `.env` (if you enter an API key interactivel
 
 The tool creates them. For a brand new project with no locale directory, it will:
 1. Scan your source code for translatable strings
-2. Ask you for target languages (if it can't detect them)
+2. Ask you for target languages (if it can't detect them), or use `--lang es,fr,de`
 3. Create the locale directories and files automatically
+4. Update your project config (`LANGUAGES` in settings.py, `resConfigs` in build.gradle, etc.)
+5. On the next run, languages are auto-detected from the config — no need to specify again
 
 ### Can I use it in a monorepo?
 

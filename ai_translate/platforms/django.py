@@ -93,8 +93,8 @@ def scan_source(project_root: Path) -> dict[str, str]:
 
 
 _LOCALE_SKIP_DIRS = frozenset({
-    "venv", ".venv", "env", "node_modules", ".git",
-    "__pycache__", "build", "dist", ".tox",
+    "venv", ".venv", "env", "virtualenv", "node_modules", ".git",
+    "__pycache__", "build", "dist", ".tox", "site-packages",
     "htmlcov", ".mypy_cache", ".ruff_cache",
     "static", "media", "staticfiles", "collected_static",
     ".idea", ".vscode", "Pods", "DerivedData",
@@ -208,37 +208,216 @@ def _find_locale_dir(project_root: Path) -> Path:
     return _chosen_locale
 
 
-def detect_target_languages(project_root: Path) -> dict[str, str]:
-    """Detect languages from the chosen locale directory or settings.py."""
+def _find_settings_files(project_root: Path) -> list[Path]:
+    """Find Django settings files (manage.py → DJANGO_SETTINGS_MODULE → file)."""
+    import re
+
+    settings_files: list[Path] = []
+
+    # Extract DJANGO_SETTINGS_MODULE from manage.py
+    manage_py = project_root / "manage.py"
+    if manage_py.is_file():
+        try:
+            manage_content = manage_py.read_text(errors="ignore")
+            m = re.search(
+                r"DJANGO_SETTINGS_MODULE['\"],\s*['\"]([^'\"]+)['\"]",
+                manage_content,
+            )
+            if m:
+                module_path = m.group(1)  # e.g. "config.settings.production"
+                parts = module_path.replace(".", "/")
+                candidate = project_root / (parts + ".py")
+                if candidate.is_file():
+                    settings_files.append(candidate)
+                # Also check all .py files in the settings directory
+                # (handles split settings: base.py, common.py, etc.)
+                settings_dir = candidate.parent
+                if settings_dir.is_dir():
+                    for sibling in sorted(settings_dir.glob("*.py")):
+                        if sibling not in settings_files and sibling.name != "__init__.py":
+                            settings_files.append(sibling)
+        except OSError:
+            pass
+
+    # Fallback: look for any settings.py in the project
+    if not settings_files:
+        for dirpath, _, filenames in walk_project(project_root):
+            if "settings.py" in filenames:
+                settings_files.append(dirpath / "settings.py")
+                break
+
+    return settings_files
+
+
+def _parse_languages_from_settings(settings_files: list[Path]) -> dict[str, str]:
+    """Parse LANGUAGES = [...] from Django settings files."""
+    import re
     from ai_translate.cli.ui import COMMON_LANGUAGES
 
-    locale_dir = _find_locale_dir(project_root)
     langs: dict[str, str] = {}
+    for fpath in settings_files:
+        try:
+            content = fpath.read_text(errors="ignore")
+            lang_block = re.search(
+                r"^LANGUAGES\s*=\s*\[(.+?)\]",
+                content, re.MULTILINE | re.DOTALL,
+            )
+            if not lang_block:
+                continue
+            block = lang_block.group(1)
+            for m2 in re.finditer(r"['\"]([a-z]{2}(?:-[a-zA-Z]+)?)['\"]", block):
+                code = m2.group(1)
+                if code not in ("en", "en-us"):
+                    langs[code] = COMMON_LANGUAGES.get(code, code)
+            if langs:
+                break
+        except OSError:
+            pass
+    return langs
+
+
+def detect_target_languages(project_root: Path) -> dict[str, str]:
+    """Detect languages — settings.py LANGUAGES first, then locale/ directory.
+
+    Priority:
+      1. LANGUAGES in settings.py — the user's explicit configuration
+      2. locale/ dirs with actual .po files — real translation work exists
+      3. locale/ dirs with LC_MESSAGES/ but no .po — scaffolded but empty
+    """
+    from ai_translate.cli.ui import COMMON_LANGUAGES
+
+    # ── Priority 1: Check settings.py for LANGUAGES ──────────────────
+    settings_files = _find_settings_files(project_root)
+    langs = _parse_languages_from_settings(settings_files)
+    if langs:
+        return langs
+
+    # ── Priority 2: Scan locale/ for dirs with actual .po files ──────
+    locale_dir = _find_locale_dir(project_root)
+    dirs_with_po: dict[str, str] = {}
+    dirs_with_lc: dict[str, str] = {}
 
     if locale_dir.is_dir():
         for child in sorted(locale_dir.iterdir()):
             if child.is_dir() and child.name not in ("en", "en_US", "__pycache__"):
+                has_lc = (child / "LC_MESSAGES").is_dir()
+                has_po = has_lc and any((child / "LC_MESSAGES").glob("*.po"))
                 code = child.name
-                if code not in langs:
-                    langs[code] = COMMON_LANGUAGES.get(code, code)
+                name = COMMON_LANGUAGES.get(code, code)
+                if has_po:
+                    dirs_with_po[code] = name
+                elif has_lc:
+                    dirs_with_lc[code] = name
 
-    # Try settings.py LANGUAGES
-    if not langs:
-        for dirpath, _, filenames in walk_project(project_root):
-            if "settings.py" in filenames:
-                try:
-                    content = (dirpath / "settings.py").read_text(errors="ignore")
-                    # Simple extraction of LANGUAGES tuples
-                    import re
-                    for m in re.finditer(r"\(\s*['\"]([a-z]{2}(?:-[a-zA-Z]+)?)['\"]", content):
-                        code = m.group(1)
-                        if code not in ("en", "en-us"):
-                            langs[code] = COMMON_LANGUAGES.get(code, code)
-                except OSError:
-                    pass
+    return dirs_with_po
+
+
+def scaffold_languages(
+    project_root: Path, languages: dict[str, str],
+) -> list[str]:
+    """Create locale/<lang>/LC_MESSAGES/django.po for each language.
+
+    Creates both the directory structure and an empty .po file so
+    the language is auto-detected on the next run.
+    """
+    locale_dir = _find_locale_dir(project_root)
+    scaffolded: list[str] = []
+    for code in languages:
+        po_file = _po_path(locale_dir, code)
+        if not po_file.is_file():
+            po_file.parent.mkdir(parents=True, exist_ok=True)
+            po = ensure_po(po_file, code)
+            atomic_save_po(po, po_file)
+            scaffolded.append(code)
+    return scaffolded
+
+
+def update_language_config(
+    project_root: Path, languages: dict[str, str],
+) -> list[str]:
+    """Add new languages to LANGUAGES in Django settings.py.
+
+    Preserves existing languages — only adds codes that are not already present.
+    If no LANGUAGES variable exists, creates one.
+    Returns list of language codes that were actually added to the config.
+    """
+    import re
+    from ai_translate.cli.ui import COMMON_LANGUAGES
+
+    settings_files = _find_settings_files(project_root)
+    if not settings_files:
+        return []
+
+    # Find the settings file that has LANGUAGES, or use the first one
+    target_file: Path | None = None
+    for fpath in settings_files:
+        try:
+            content = fpath.read_text(errors="ignore")
+            if re.search(r"^LANGUAGES\s*=\s*\[", content, re.MULTILINE):
+                target_file = fpath
                 break
+        except OSError:
+            continue
 
-    return langs
+    if not target_file:
+        target_file = settings_files[0]
+
+    try:
+        content = target_file.read_text(errors="ignore")
+    except OSError:
+        return []
+
+    # Parse existing language codes from LANGUAGES = [...]
+    existing_codes: set[str] = {"en", "en-us"}  # always consider en as existing
+    lang_match = re.search(
+        r"^LANGUAGES\s*=\s*\[(.+?)\]",
+        content, re.MULTILINE | re.DOTALL,
+    )
+    if lang_match:
+        block = lang_match.group(1)
+        for m in re.finditer(r"['\"]([a-z]{2}(?:-[a-zA-Z]+)?)['\"]", block):
+            existing_codes.add(m.group(1))
+
+    # Determine which codes are new
+    new_codes = [code for code in languages if code not in existing_codes]
+    if not new_codes:
+        return []
+
+    # Build new language entries
+    new_entries = []
+    for code in new_codes:
+        name = COMMON_LANGUAGES.get(code, code.title())
+        new_entries.append(f"    ('{code}', '{name}'),")
+    new_block = "\n".join(new_entries)
+
+    if lang_match:
+        # LANGUAGES exists — insert new entries before the closing ]
+        # Find the position of the closing ] for the LANGUAGES block
+        block_start = lang_match.start()
+        block_end = lang_match.end()
+        # Insert before the closing ]
+        before_bracket = content[:block_end - 1].rstrip()
+        # Ensure trailing comma on last existing entry
+        if before_bracket and not before_bracket.endswith(","):
+            before_bracket += ","
+        updated = before_bracket + "\n" + new_block + "\n" + content[block_end - 1:]
+    else:
+        # No LANGUAGES variable — add one at the end
+        all_entries = [f"    ('en', 'English'),"]
+        for code in new_codes:
+            name = COMMON_LANGUAGES.get(code, code.title())
+            all_entries.append(f"    ('{code}', '{name}'),")
+        languages_block = "\nLANGUAGES = [\n" + "\n".join(all_entries) + "\n]\n"
+        updated = content.rstrip() + "\n" + languages_block
+
+    try:
+        target_file.write_text(updated, encoding="utf-8")
+        log.debug("Updated LANGUAGES in %s: added %s", target_file, new_codes)
+    except OSError as exc:
+        log.warning("Could not update settings: %s", exc)
+        return []
+
+    return new_codes
 
 
 # ── PO file management ────────────────────────────────────────────────
@@ -268,8 +447,8 @@ def _collect_existing_translations(locale_dirs: list[Path], lang_code: str) -> s
                         existing.add(encode_plural(entry.msgid, entry.msgid_plural))
                 elif entry.msgstr and entry.msgstr.strip():
                     existing.add(entry.msgid)
-        except Exception:
-            pass
+        except Exception as exc:
+            log.debug("Could not parse PO file %s: %s", path, exc)
     return existing
 
 

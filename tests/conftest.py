@@ -75,10 +75,17 @@ def tmp_django_project(tmp_path: Path) -> Path:
         encoding="utf-8",
     )
 
-    # locale dirs for es and fr
+    # locale dirs for es and fr — with actual .po files
     for lang in ("es", "fr"):
         lc_dir = tmp_path / "locale" / lang / "LC_MESSAGES"
         lc_dir.mkdir(parents=True)
+        # Create a minimal valid .po file so language detection finds it
+        po_content = (
+            f'msgid ""\nmsgstr ""\n'
+            f'"Content-Type: text/plain; charset=UTF-8\\n"\n'
+            f'"Language: {lang}\\n"\n\n'
+        )
+        (lc_dir / "django.po").write_text(po_content, encoding="utf-8")
 
     return tmp_path
 
@@ -203,9 +210,15 @@ def tmp_flask_project(tmp_path: Path) -> Path:
         encoding="utf-8",
     )
 
-    # translations directory
+    # translations directory — with actual .po file
     es_lc = tmp_path / "translations" / "es" / "LC_MESSAGES"
     es_lc.mkdir(parents=True)
+    po_content = (
+        'msgid ""\nmsgstr ""\n'
+        '"Content-Type: text/plain; charset=UTF-8\\n"\n'
+        '"Language: es\\n"\n\n'
+    )
+    (es_lc / "messages.po").write_text(po_content, encoding="utf-8")
 
     return tmp_path
 

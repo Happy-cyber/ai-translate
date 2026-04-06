@@ -39,13 +39,25 @@ def walk_project(root: Path, extra_skip: set[str] | None = None):
         yield Path(dirpath), dirnames, filenames
 
 
-def atomic_write_text(path: Path, content: str, encoding: str = "utf-8") -> None:
-    """Write *content* to *path* atomically (temp-file + rename)."""
+def atomic_write_text(
+    path: Path,
+    content: str,
+    encoding: str = "utf-8",
+    validate: "callable | None" = None,
+) -> None:
+    """Write *content* to *path* atomically (temp-file + rename).
+
+    If *validate* is provided, it is called with the temp file path
+    BEFORE the atomic rename. If it raises, the write is aborted and
+    the original file stays untouched.
+    """
     path.parent.mkdir(parents=True, exist_ok=True)
     fd, tmp = tempfile.mkstemp(dir=path.parent, suffix=".tmp")
     try:
         with os.fdopen(fd, "w", encoding=encoding) as fh:
             fh.write(content)
+        if validate:
+            validate(Path(tmp))
         shutil.move(tmp, path)
     except BaseException:
         with open(os.devnull, "w") as _:

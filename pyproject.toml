@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "ai-translate"
-version = "1.0.1"
+version = "1.0.2"
 description = "Zero-config AI localization for developers. One command. Every platform."
 readme = "README.md"
 license = "MIT"

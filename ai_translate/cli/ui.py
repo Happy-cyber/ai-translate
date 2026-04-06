@@ -152,7 +152,7 @@ def show_env_key_status(key_status: dict[str, str | None], labels: dict[str, str
 
 
 def prompt_provider_selection() -> str:
-    if _should_suppress():
+    if _should_suppress() or not sys.stdin.isatty():
         return PROVIDER_MENU[0]["key"]
     console.print("  [bold bright_cyan]Select Translation Engine[/]")
     console.print()
@@ -277,7 +277,7 @@ def prompt_choose_path(
                     return p
             # Saved path no longer valid — will re-prompt
 
-    if _should_suppress():
+    if _should_suppress() or not sys.stdin.isatty():
         return paths[0]
 
     console.print()
@@ -606,7 +606,7 @@ def show_final_report(
 
 
 def prompt_target_languages() -> dict[str, str]:
-    if _should_suppress():
+    if _should_suppress() or not sys.stdin.isatty():
         return {}
     console.print(f"  {_WARN} [yellow]No target languages detected.[/]")
     console.print("  [dim]Enter language codes separated by commas (e.g. es,fr,de,ja,ko,zh)[/]")

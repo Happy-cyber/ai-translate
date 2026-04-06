@@ -192,6 +192,46 @@ def detect_target_languages(project_root: Path) -> dict[str, str]:
     return langs
 
 
+def scaffold_languages(
+    project_root: Path, languages: dict[str, str],
+) -> list[str]:
+    """Create empty ARB files (lib/l10n/app_<lang>.arb) for each language."""
+    arb_dir, template = _get_config(project_root)
+    if not arb_dir:
+        arb_dir = project_root / "lib" / "l10n"
+    arb_dir.mkdir(parents=True, exist_ok=True)
+
+    # Detect template filename pattern (e.g. "app_en.arb" → prefix "app_")
+    prefix = "app_"
+    if template and template.is_file():
+        m = re.match(r"^(.+?)(?:en|en_US|en_GB)\.arb$", template.name)
+        if m:
+            prefix = m.group(1)
+
+    scaffolded: list[str] = []
+    for code in languages:
+        arb_file = arb_dir / f"{prefix}{code}.arb"
+        if not arb_file.is_file():
+            arb_file.write_text(
+                json.dumps({"@@locale": code}, indent=2, ensure_ascii=False) + "\n",
+                encoding="utf-8",
+            )
+            scaffolded.append(code)
+    return scaffolded
+
+
+def update_language_config(
+    project_root: Path, languages: dict[str, str],
+) -> list[str]:
+    """For Flutter, .arb files ARE the language config.
+
+    scaffold_languages() already creates the .arb files.
+    This function is a no-op to maintain cross-platform consistency.
+    Returns empty list (config is the .arb files themselves).
+    """
+    return []
+
+
 def get_missing_translations(
     project_root: Path,
     source_strings: dict[str, str],
@@ -206,15 +246,20 @@ def get_missing_translations(
             for f in arb_dir.iterdir():
                 if not f.name.endswith(".arb"):
                     continue
-                locale_match = re.search(r"_([a-z]{2}(?:_[A-Z]{2})?)\.arb$", f.name)
-                if locale_match and locale_match.group(1) == lang_code:
-                    try:
-                        data = json.loads(f.read_text(encoding="utf-8"))
-                        for k, v in data.items():
-                            if not k.startswith("@") and isinstance(v, str) and v.strip():
-                                existing_keys.add(k)
-                    except (json.JSONDecodeError, OSError):
-                        pass
+                # Match locale from @@locale field first, then filename
+                try:
+                    data = json.loads(f.read_text(encoding="utf-8"))
+                except (json.JSONDecodeError, OSError):
+                    continue
+                file_locale = data.get("@@locale", "")
+                if not file_locale:
+                    # Fallback: extract from filename (app_es.arb, strings_pt_BR.arb, es.arb)
+                    m = re.search(r"(?:^|_)([a-z]{2}(?:[_-][A-Z]{2})?)\.arb$", f.name)
+                    file_locale = m.group(1) if m else ""
+                if file_locale == lang_code:
+                    for k, v in data.items():
+                        if not k.startswith("@") and isinstance(v, str) and v.strip():
+                            existing_keys.add(k)
 
         lang_missing = [k for k in source_strings if k not in existing_keys]
         if lang_missing:
@@ -242,7 +287,11 @@ def write_translations(
         # Find or create target ARB file
         target_name = f"app_{lang_code}.arb"
         if template:
-            prefix = template.stem.rsplit("_", 1)[0]
+            # Extract prefix by removing the locale suffix (handles app_en, app_en_US, etc.)
+            import re as _re
+            stem = template.stem
+            m = _re.match(r'^(.+?)_(?:en|en_US|en_GB|[a-z]{2}(?:_[A-Z]{2})?)$', stem)
+            prefix = m.group(1) if m else stem.rsplit("_", 1)[0]
             target_name = f"{prefix}_{lang_code}.arb"
 
         target_path = arb_dir / target_name
@@ -266,7 +315,13 @@ def write_translations(
         existing["@@locale"] = lang_code
 
         content = json.dumps(existing, ensure_ascii=False, indent=2) + "\n"
-        atomic_write_text(target_path, content)
+
+        def _validate_arb(tmp: Path) -> None:
+            data = json.loads(tmp.read_text(encoding="utf-8"))
+            if not isinstance(data, dict) or "@@locale" not in data:
+                raise ValueError(f"Invalid ARB: missing @@locale in {target_path.name}")
+
+        atomic_write_text(target_path, content, validate=_validate_arb)
         stats[lang_code] = added
 
     return stats

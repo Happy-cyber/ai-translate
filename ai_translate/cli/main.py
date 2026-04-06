@@ -405,6 +405,26 @@ def _run(args: argparse.Namespace) -> None:
     elif args.json:
         ui.set_output_mode("json")
 
+    # ── Input validation ────────────────────────────────────────────
+    if args.batch_size < 0:
+        ui.show_error("--batch-size must be a non-negative integer.")
+        sys.exit(1)
+    if args.workers < 1 or args.workers > 10:
+        ui.show_error("--workers must be between 1 and 10.")
+        sys.exit(1)
+    if args.min_quality < 0 or args.min_quality > 100:
+        ui.show_error("--min-quality must be between 0 and 100.")
+        sys.exit(1)
+    if args.lang:
+        import re as _re
+        for code in (c.strip() for c in args.lang.split(",") if c.strip()):
+            if not _re.fullmatch(r"[a-zA-Z]{2,3}(?:[_-][a-zA-Z]{2,4})?", code):
+                ui.show_error(
+                    f"Invalid language code: '{code}'\n"
+                    f"  Expected ISO format like: es, fr, zh-TW, pt-BR, zh-Hans"
+                )
+                sys.exit(1)
+
     # ── STEP 0: BOOT ─────────────────────────────────────────────────
     ui.show_boot_sequence()
 
@@ -428,8 +448,10 @@ def _run(args: argparse.Namespace) -> None:
         ui.show_step(2, "ENVIRONMENT SETUP")
 
     # Load .env file (prompts user if multiple found, saves choice per project)
+    # --estimate is read-only — never create .env
     chosen_env = env_manager.load_env_file(project_root=project_root)
-    env_manager.ensure_env_exists()
+    if not args.estimate:
+        env_manager.ensure_env_exists()
     key_status = env_manager.get_env_status()
     if not args.estimate:
         if chosen_env:
@@ -641,27 +663,93 @@ def _run(args: argparse.Namespace) -> None:
     ui.show_step(4, "DETECTING LANGUAGES")
 
     target_languages = handler.detect_target_languages(project_root)
-    if not target_languages:
+
+    # --lang: if user specified languages, use them (even if none detected from project)
+    _languages_from_user = False  # track if user manually specified languages
+    if args.lang:
+        from ai_translate.cli.ui import COMMON_LANGUAGES
+        requested_codes = [c.strip() for c in args.lang.split(",") if c.strip()]
+        if target_languages:
+            # Filter detected languages to requested codes
+            filtered_langs = {
+                code: name for code, name in target_languages.items()
+                if code in requested_codes
+            }
+            # Also include requested codes NOT in detected (user wants new languages)
+            new_langs = {
+                code: COMMON_LANGUAGES.get(code, code) for code in requested_codes
+                if code not in target_languages
+            }
+            if filtered_langs or new_langs:
+                target_languages = {**filtered_langs, **new_langs}
+                _languages_from_user = bool(new_langs)
+                ui.show_info(f"Filtered to {len(target_languages)} language(s): {', '.join(target_languages.keys())}")
+            else:
+                ui.show_error(
+                    f"None of the specified languages ({args.lang}) found in project.\n"
+                    f"  Available: {', '.join(target_languages.keys())}\n"
+                    f"  Use one of the available codes, e.g.: --lang {','.join(list(target_languages.keys())[:3])}"
+                )
+                sys.exit(1)
+        else:
+            # No languages detected — use --lang codes directly
+            target_languages = {
+                code: COMMON_LANGUAGES.get(code, code) for code in requested_codes
+            }
+            _languages_from_user = True
+            ui.show_info(f"Using specified language(s): {', '.join(target_languages.keys())}")
+    elif not target_languages:
         ui.show_warning("No target languages detected from project files.")
         target_languages = ui.prompt_target_languages()
+        if target_languages:
+            _languages_from_user = True
 
-    # --lang: filter to specified language codes
-    if args.lang:
-        requested_codes = [c.strip() for c in args.lang.split(",") if c.strip()]
-        filtered_langs = {
-            code: name for code, name in target_languages.items()
-            if code in requested_codes
+    if not target_languages:
+        _lang_hints = {
+            "django": (
+                'Run: [bold]django-admin makemessages -l <lang_code>[/]\n'
+                '  Or create locale/<lang_code>/LC_MESSAGES/ directories.\n'
+                '  Or specify languages directly: [bold]ai-translate --lang es,fr,de[/]'
+            ),
+            "flask": (
+                'Create translations/<lang_code>/LC_MESSAGES/ directories.\n'
+                '  Or specify languages directly: [bold]ai-translate --lang es,fr,de[/]'
+            ),
+            "fastapi": (
+                'Create translations/<lang_code>/LC_MESSAGES/ directories.\n'
+                '  Or specify languages directly: [bold]ai-translate --lang es,fr,de[/]'
+            ),
+            "flutter": (
+                'Add ARB files like lib/l10n/app_es.arb for each target language.\n'
+                '  Or specify languages directly: [bold]ai-translate --lang es,fr,de[/]'
+            ),
+            "android": (
+                'Create resource directories like res/values-es/, res/values-fr/.\n'
+                '  Or specify languages directly: [bold]ai-translate --lang es,fr,de[/]'
+            ),
+            "ios": (
+                'Create .lproj directories like es.lproj/, fr.lproj/.\n'
+                '  Or specify languages directly: [bold]ai-translate --lang es,fr,de[/]'
+            ),
         }
-        if filtered_langs:
-            target_languages = filtered_langs
-            ui.show_info(f"Filtered to {len(target_languages)} language(s): {', '.join(target_languages.keys())}")
-        else:
-            ui.show_error(
-                f"None of the specified languages ({args.lang}) found in project.\n"
-                f"  Available: {', '.join(target_languages.keys())}\n"
-                f"  Use one of the available codes, e.g.: --lang {','.join(list(target_languages.keys())[:3])}"
-            )
-            sys.exit(1)
+        hint = _lang_hints.get(platform, 'Specify languages: [bold]ai-translate --lang es,fr,de[/]')
+        ui.show_error(
+            f"No target languages configured.\n\n"
+            f"  Found {len(source_strings)} source strings, but no languages to translate into.\n\n"
+            f"  Hint: {hint}"
+        )
+        sys.exit(1)
+
+    # ── Scaffold language structure if user specified new languages ────
+    if _languages_from_user and hasattr(handler, "scaffold_languages"):
+        scaffolded = handler.scaffold_languages(project_root, target_languages)
+        if scaffolded:
+            ui.show_success(f"Created language structure for: {', '.join(scaffolded)}")
+        # Update project config file (settings.py, build.gradle, etc.)
+        if hasattr(handler, "update_language_config"):
+            config_added = handler.update_language_config(project_root, target_languages)
+            if config_added:
+                ui.show_success(f"Updated project config with: {', '.join(config_added)}")
 
     ui.show_platform_detected(
         platform=platform,
@@ -801,6 +889,20 @@ def _run(args: argparse.Namespace) -> None:
         sys.exit(1 if drift_results else 0)
 
     if args.dry_run:
+        if args.json:
+            elapsed = time.time() - start_time
+            report = {
+                "status": "dry_run",
+                "platform": platform,
+                "source_count": len(source_strings),
+                "missing_count": total_missing,
+                "lang_count": len(target_languages),
+                "languages": list(target_languages.keys()),
+                "missing_strings": sorted(all_missing_keys),
+                "elapsed": round(elapsed, 2),
+            }
+            ui.show_json_report(report)
+            return
         ui.show_dry_run_messages(sorted(all_missing_keys), len(target_languages))
         return
 
@@ -1185,9 +1287,13 @@ def main() -> None:
     parser = build_parser()
     args = parser.parse_args()
 
-    # Logging
-    level = logging.DEBUG if args.debug else logging.WARNING
-    logging.basicConfig(level=level, format="[%(levelname)s] %(message)s")
+    # Logging — only show logs in --debug mode. In normal mode, suppress
+    # ALL log output (WARNING, ERROR) to keep the UI clean. Errors are
+    # handled via ui.show_error() instead of logging.
+    if args.debug:
+        logging.basicConfig(level=logging.DEBUG, format="[%(levelname)s] %(message)s")
+    else:
+        logging.basicConfig(level=logging.CRITICAL + 1)  # suppress everything
 
     # Lock
     if not _acquire_lock():

@@ -111,23 +111,18 @@ def should_skip_message(msg: str) -> bool:
 
 
 def atomic_save_po(po: polib.POFile, target: Path) -> None:
-    """Save a PO file atomically via a temporary file and :func:`shutil.move`.
+    """Save a PO file atomically with post-write validation.
 
-    The target's parent directories are created if they do not already
-    exist.  A temporary file is written in the same directory as *target*
-    so that the final :func:`shutil.move` is an atomic rename on most
-    filesystems.  If anything goes wrong the temporary file is cleaned up
-    before the exception propagates.
-
-    Args:
-        po: The :class:`polib.POFile` instance to persist.
-        target: Destination path for the ``.po`` file.
+    Writes to a temp file, validates the output is a parseable PO file,
+    then atomically renames. If validation fails, the original is untouched.
     """
     target.parent.mkdir(parents=True, exist_ok=True)
     fd, tmp = tempfile.mkstemp(dir=target.parent, suffix=".po.tmp")
     try:
         os.close(fd)
         po.save(tmp)
+        # Validate: re-parse the temp file to ensure it's not corrupted
+        polib.pofile(tmp)
         shutil.move(tmp, target)
     except BaseException:
         try:

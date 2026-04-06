@@ -158,10 +158,33 @@ def scan_source(project_root: Path) -> dict[str, str]:
 
 
 def detect_target_languages(project_root: Path) -> dict[str, str]:
+    """Detect languages — build.gradle resConfigs first, then res/ directories.
+
+    Priority:
+      1. build.gradle resConfigs — user's explicit configuration
+      2. res/values-XX/ dirs with actual .xml files — real translations
+      3. res/values-XX/ empty dirs — scaffolded but empty
+    """
     from ai_translate.cli.ui import COMMON_LANGUAGES
 
+    # ── Priority 1: Check build.gradle for resConfigs ────────────────
     langs: dict[str, str] = {}
+    for gradle_name in ("app/build.gradle", "app/build.gradle.kts"):
+        gradle = project_root / gradle_name
+        if gradle.is_file():
+            content = gradle.read_text(errors="ignore")
+            for m in re.finditer(r'resConfigs?\s+["\']([a-z]{2})["\']', content):
+                code = m.group(1)
+                if code != "en":
+                    langs[code] = COMMON_LANGUAGES.get(code, code)
+            break
+    if langs:
+        return langs
+
+    # ── Priority 2 & 3: Scan res/values-XX/ directories ──────────────
     values_dir = _find_source_values_dir(project_root)
+    dirs_with_xml: dict[str, str] = {}
+    dirs_empty: dict[str, str] = {}
 
     if values_dir:
         res_dir = values_dir.parent
@@ -170,21 +193,100 @@ def detect_target_languages(project_root: Path) -> dict[str, str]:
                 code = child.name.split("values-", 1)[1]
                 if code and code not in ("en", "en-rUS"):
                     code_normalized = code.replace("-r", "-")
-                    langs[code] = COMMON_LANGUAGES.get(code_normalized, code)
+                    name = COMMON_LANGUAGES.get(code_normalized, code)
+                    has_xml = any(f.suffix == ".xml" for f in child.iterdir())
+                    if has_xml:
+                        dirs_with_xml[code] = name
+                    else:
+                        dirs_empty[code] = name
 
-    # Fallback: check build.gradle resConfigs
-    if not langs:
-        for gradle_name in ("app/build.gradle", "app/build.gradle.kts"):
-            gradle = project_root / gradle_name
-            if gradle.is_file():
-                content = gradle.read_text(errors="ignore")
-                for m in re.finditer(r'resConfigs?\s+["\']([a-z]{2})["\']', content):
-                    code = m.group(1)
-                    if code != "en":
-                        langs[code] = COMMON_LANGUAGES.get(code, code)
-                break
+    return dirs_with_xml
 
-    return langs
+
+def scaffold_languages(
+    project_root: Path, languages: dict[str, str],
+) -> list[str]:
+    """Create res/values-<lang>/strings.xml for each language.
+
+    Creates an empty strings.xml so the language is auto-detected.
+    """
+    values_dir = _find_source_values_dir(project_root)
+    if not values_dir:
+        values_dir = project_root / "app" / "src" / "main" / "res" / "values"
+    res_dir = values_dir.parent
+
+    scaffolded: list[str] = []
+    for code in languages:
+        lang_dir = res_dir / f"values-{code}"
+        strings_xml = lang_dir / "strings.xml"
+        if not strings_xml.is_file():
+            lang_dir.mkdir(parents=True, exist_ok=True)
+            atomic_write_text(
+                strings_xml,
+                '<?xml version="1.0" encoding="utf-8"?>\n<resources>\n</resources>\n',
+            )
+            scaffolded.append(code)
+    return scaffolded
+
+
+def update_language_config(
+    project_root: Path, languages: dict[str, str],
+) -> list[str]:
+    """Add new language codes to resConfigs in build.gradle.
+
+    Preserves existing resConfigs — only adds codes not already present.
+    Returns list of language codes added.
+    """
+    gradle_path: Path | None = None
+    for name in ("app/build.gradle", "app/build.gradle.kts"):
+        candidate = project_root / name
+        if candidate.is_file():
+            gradle_path = candidate
+            break
+
+    if not gradle_path:
+        return []
+
+    try:
+        content = gradle_path.read_text(errors="ignore")
+    except OSError:
+        return []
+
+    # Parse existing resConfigs
+    existing_codes: set[str] = {"en"}
+    res_match = re.search(
+        r'resConfigs?\s+((?:["\'][a-z]{2}(?:-r?[A-Z]{2})?["\'][\s,]*)+)',
+        content,
+    )
+    if res_match:
+        for m in re.finditer(r'["\']([a-z]{2}(?:-r?[A-Z]{2})?)["\']', res_match.group(1)):
+            existing_codes.add(m.group(1))
+
+    new_codes = [code for code in languages if code not in existing_codes]
+    if not new_codes:
+        return []
+
+    if res_match:
+        # Append new codes to existing resConfigs
+        old_block = res_match.group(0).rstrip()
+        new_entries = ", ".join(f'"{code}"' for code in new_codes)
+        updated = content[:res_match.end()].rstrip() + ", " + new_entries + content[res_match.end():]
+    else:
+        # No resConfigs — add inside defaultConfig block
+        new_entries = ", ".join(f'"{code}"' for code in ["en"] + new_codes)
+        dc_match = re.search(r"(defaultConfig\s*\{)", content)
+        if dc_match:
+            insert_pos = dc_match.end()
+            updated = content[:insert_pos] + f"\n        resConfigs {new_entries}" + content[insert_pos:]
+        else:
+            return []  # No defaultConfig block found
+
+    try:
+        gradle_path.write_text(updated, encoding="utf-8")
+    except OSError:
+        return []
+
+    return new_codes
 
 
 def get_missing_translations(
@@ -272,13 +374,22 @@ def write_translations(
 
             added += 1
 
-        # Merge with existing entries
+        # Merge with existing entries (avoid duplicates)
         if target_path.is_file():
             try:
                 existing_tree = ET.parse(target_path)
                 existing_root = existing_tree.getroot()
+                # Collect existing element names to avoid duplicates
+                existing_names: set[str] = set()
+                for elem in existing_root:
+                    name = elem.get("name", "")
+                    if name:
+                        existing_names.add(name)
+                # Only append elements that don't already exist
                 for new_elem in root:
-                    existing_root.append(new_elem)
+                    name = new_elem.get("name", "")
+                    if name and name not in existing_names:
+                        existing_root.append(new_elem)
                 root = existing_root
             except ET.ParseError:
                 pass
@@ -286,7 +397,14 @@ def write_translations(
         ET.indent(ET.ElementTree(root), space="    ")
         xml_str = ET.tostring(root, encoding="unicode", xml_declaration=False)
         content = '<?xml version="1.0" encoding="utf-8"?>\n' + xml_str + "\n"
-        atomic_write_text(target_path, content)
+
+        def _validate_xml(tmp: Path) -> None:
+            tree = ET.parse(str(tmp))
+            r = tree.getroot()
+            if r.tag != "resources":
+                raise ValueError(f"Invalid Android XML: root is <{r.tag}>, expected <resources>")
+
+        atomic_write_text(target_path, content, validate=_validate_xml)
         stats[lang_code] = added
 
     return stats
