@@ -161,7 +161,7 @@ ngettext("%(count)d item", "%(count)d items", count)  # plurals
 NSLocalizedString("Welcome", comment: "")
 ```
 
-### Language Detection Priority (v1.0.2)
+### Language Detection Priority
 
 Each platform detects languages using a priority system — **project config is always checked first**, then locale files:
 
@@ -175,7 +175,7 @@ Each platform detects languages using a priority system — **project config is 
 
 This ensures the tool respects your project's explicit language configuration rather than guessing from directory structure.
 
-### Input Validation (v1.0.2)
+### Input Validation
 
 All user inputs are validated before the pipeline starts:
 
@@ -310,9 +310,9 @@ If your primary provider is down, the tool automatically tries the next availabl
 
 If Claude fails after 3 retries → OpenAI is tried → if that fails → Gemini is tried.
 
-**Runtime failover (v1.0.1):** If a provider breaks mid-translation (after batch 50 of 400), the tool detects 3 consecutive failures and automatically switches to the next working provider for the remaining batches — no restart needed.
+**Runtime failover:** If a provider breaks mid-translation (after batch 50 of 400), the tool detects 3 consecutive failures and automatically switches to the next working provider for the remaining batches — no restart needed.
 
-### Auto Language Setup (v1.0.2)
+### Auto Language Setup
 
 When no target languages are detected, the tool guides you through setup and automatically configures your project:
 
