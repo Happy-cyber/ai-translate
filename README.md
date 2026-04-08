@@ -6,6 +6,7 @@
 [![Downloads](https://static.pepy.tech/badge/ai-translate)](https://pepy.tech/projects/ai-translate)
 [![Python](https://img.shields.io/pypi/pyversions/ai-translate)](https://pypi.org/project/ai-translate/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+[![CI](https://github.com/Happy-cyber/ai-translate/actions/workflows/ci.yml/badge.svg)](https://github.com/Happy-cyber/ai-translate/actions/workflows/ci.yml)
 
 ```bash
 pip install -U ai-translate
