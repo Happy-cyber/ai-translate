@@ -3,7 +3,7 @@
 **Zero-config AI localization for developers. One command. Every platform.**
 
 [![PyPI version](https://img.shields.io/pypi/v/ai-translate)](https://pypi.org/project/ai-translate/)
-[![Downloads](https://img.shields.io/pypi/dm/ai-translate)](https://pypi.org/project/ai-translate/)
+[![Downloads](https://static.pepy.tech/badge/ai-translate)](https://pepy.tech/projects/ai-translate)
 [![Python](https://img.shields.io/pypi/pyversions/ai-translate)](https://pypi.org/project/ai-translate/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
